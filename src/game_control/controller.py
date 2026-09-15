@@ -2576,6 +2576,9 @@ class Controller:
                 baseline_preset=entry.baseline_preset,
                 candidate_preset=entry.candidate_preset,
                 campaign=entry.campaign,
+                maintenance_window=entry.maintenance_window,
+                rollback_safe=entry.rollback_safe,
+                public_wake_policy=entry.public_wake_policy,
             )
             for entry in self._schedule.entries
         ))

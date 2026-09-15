@@ -100,7 +100,7 @@ def page(web_server):
         latest = {"status": status}
         schedules = [
             {"cron": "0 8 * * 4", "profile": "pz-rising", "next_fire": "2026-07-16T08:00:00Z", "enabled": False},
-            {"cron": "0 20 * * 5", "profile": "minecraft", "next_fire": "2026-07-17T20:00:00Z", "enabled": True},
+            {"cron": "0 20 * * 5", "profile": "minecraft", "next_fire": "2026-07-17T20:00:00Z", "enabled": True, "operation": "backup", "backup_destination": "horizon-b2"},
         ]
 
         def fulfill(route):
@@ -307,6 +307,34 @@ def test_session_deck_desktop_layout_stays_compact(page: Page, tmp_path: Path):
     assert connection_state.evaluate("(node) => node.getBoundingClientRect().width > 1")
 
 
+@pytest.mark.parametrize("width", [320, 375, 390])
+def test_phone_next_automation_label_wraps_without_clipping(page: Page, width: int):
+    # The compound "operation (destination) · profile · next run" label is wider
+    # than a phone column; it must wrap inside the deck instead of clipping, and
+    # every part of the label must still be present.
+    page.set_viewport_size({"width": width, "height": 760})
+    page.reload()
+    page.wait_for_selector('[data-profile-id="minecraft"]', timeout=5000)
+    summary = page.locator("#session-automation")
+    expect(summary).to_contain_text("Backup (Horizon B2) · Minecraft ·")
+    parts = [part.strip() for part in summary.inner_text().split("·")]
+    assert len(parts) == 3
+    assert parts[0].startswith("Backup (Horizon B2)")
+    assert parts[1] == "Minecraft"
+    assert parts[2]
+    assert page.evaluate(
+        """() => {
+          const node = document.querySelector('#session-automation');
+          const box = node.getBoundingClientRect();
+          const cell = node.closest('div').getBoundingClientRect();
+          return node.scrollWidth <= node.clientWidth + 1
+            && box.right <= cell.right + 1
+            && box.right <= window.innerWidth;
+        }"""
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
 def test_profile_cards_follow_fallback_and_future_append_order(page: Page):
     assert page.locator("#profile-cards").locator("[data-profile-id]").evaluate_all(
         "(cards) => cards.map((card) => card.dataset.profileId)"
@@ -315,7 +343,8 @@ def test_profile_cards_follow_fallback_and_future_append_order(page: Page):
 
 def test_dashboard_automation_uses_soonest_enabled_schedule(page: Page):
     summary = page.locator("#session-automation")
-    assert summary.inner_text().startswith("Minecraft · ")
+    # The home summary names the operation, not just the target and the time.
+    assert summary.inner_text().startswith("Backup (Horizon B2) · Minecraft · ")
     assert "Project Zomboid" not in summary.inner_text()
 
 
@@ -783,7 +812,7 @@ def test_schedule_management_updates_live_automation_summary(page: Page):
     page.locator("#schedule-cron").fill("30 21 * * 6")
     page.locator("#schedule-profile").select_option("terraria-vanilla")
     with page.expect_response(lambda response: response.request.method == "POST" and urlparse(response.url).path == "/api/v1/schedules"):
-        page.locator("#schedule-form").get_by_role("button", name="Add schedule", exact=True).click()
+        page.locator("#schedule-form").get_by_role("button", name="Add profile switch", exact=True).click()
     expect(page.locator("#schedule-list [data-schedule-row]")).to_have_count(3)
     assert page.locator("#schedule-cron").input_value() == ""
     assert page.evaluate("document.activeElement === document.querySelector('#schedule-cron')")
@@ -1776,7 +1805,10 @@ def test_tps_empty_window_renders_explicit_stale_latest_observation(page: Page):
     expect(page.locator("#stats-mspt-current")).to_have_text("18.50 ms/tick")
     assert "Last observation:" in page.locator("#stats-tps-note").inner_text()
     expect(page.locator("#stats-recorder-table tr")).to_have_count(1)
-    expect(page.locator("#stats-recorder-table td")).to_have_text("No telemetry in this window.")
+    # The empty state names the selected window instead of a bare "this window".
+    expect(page.locator("#stats-recorder-table td")).to_have_text(
+        "No telemetry samples are recorded in the selected window (last 6 hours)."
+    )
 
 
 def test_malformed_and_unknown_server_hashes_fall_back_to_dashboard(page: Page):

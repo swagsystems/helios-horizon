@@ -203,7 +203,19 @@ h3 { font-size: 1rem; font-weight: 650; line-height: 1.2; }
 .session-facts { display: flex; min-width: 0; align-items: end; justify-content: space-between; gap: var(--sp-6); border-top: 1px solid var(--line); padding-top: var(--sp-4); }
 .session-endpoint { display: grid; grid-template-columns: minmax(0, auto) auto; align-items: center; gap: var(--sp-1) var(--sp-2); min-width: 0; }
 .session-endpoint .eyebrow { grid-column: 1 / -1; }
-.session-endpoint code { overflow: hidden; color: var(--ink); font-size: .86rem; text-overflow: ellipsis; white-space: nowrap; }
+.session-endpoint code { min-width: 0; overflow: hidden; color: var(--ink); font-size: .86rem; overflow-wrap: anywhere; text-overflow: ellipsis; white-space: nowrap; }
+/* The join help and readiness hints are extra rows in the session deck, so the
+   inter-row gap is folded into their own margin to keep the deck compact. */
+.client-help { grid-column: 1 / -1; margin-top: calc(-1 * var(--sp-1)); color: var(--muted); font-size: .76rem; }
+.client-help summary { display: inline-flex; min-height: 32px; align-items: center; cursor: pointer; color: var(--muted); font-weight: 700; text-underline-offset: 3px; }
+.client-help summary:hover { color: var(--ink); }
+.client-help p { margin: 4px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.client-help-runtime { color: var(--ink); }
+/* A 44px hit target without growing the row, using the same negative-margin
+   pattern as .breadcrumb a and .manage-link. */
+.readiness-preference { margin: calc(var(--sp-2) - var(--sp-4)) 0 0; color: var(--muted); font-size: .74rem; line-height: 1.2; }
+.readiness-preference a { display: inline-flex; min-height: 44px; align-items: center; margin: -16px 0; color: var(--muted); font-weight: 700; text-underline-offset: 3px; }
+.readiness-preference a:hover { color: var(--accent); }
 .slot-metrics { display: flex; flex-wrap: wrap; justify-content: end; gap: var(--sp-5); margin: 0; }
 .slot-metrics div { min-width: 68px; }
 .slot-metrics dd { white-space: nowrap; }
@@ -238,6 +250,10 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .skeleton-actions { width: 62%; height: 34px; margin-top: 2px; }
 .profile-card::before { position: absolute; inset: 0 auto 0 0; width: 3px; border-radius: var(--radius) 0 0 var(--radius); background: var(--raised); content: ""; }
 .profile-card.is-active::before { background: linear-gradient(180deg, var(--accent), var(--accent-deep)); }
+.profile-card.is-unavailable { border-style: dashed; background: var(--surface); }
+.profile-card.is-unavailable::before { background: repeating-linear-gradient(180deg, var(--muted) 0 6px, transparent 6px 12px); }
+.profile-card.is-unavailable .profile-name, .profile-card.is-unavailable .status-badge { color: var(--muted); }
+.nav-item.is-unavailable { color: var(--muted); opacity: .68; }
 .card-topline { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
 .profile-kicker { color: var(--muted); font: 700 .62rem/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; text-transform: uppercase; }
 .status-badge { display: inline-flex; align-items: center; gap: 6px; border-radius: 2px; padding: 4px 7px; color: var(--ink); background: var(--raised); font: 700 .62rem/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: lowercase; }
@@ -364,9 +380,12 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .rail-card h2 { font-size: 1.05rem; }
 .rail-stat { display: grid; gap: 4px; border-top: 1px solid var(--line); padding-top: 12px; }
 .rail-stat span { color: var(--muted); font: 700 .68rem/1 ui-monospace, monospace; text-transform: uppercase; }
-.rail-stat strong { font-size: 1.1rem; }
+.rail-stat strong { min-width: 0; font-size: 1.1rem; overflow-wrap: anywhere; }
 .rail-stat p { margin: 0; color: var(--muted); font-size: .76rem; line-height: 1.5; }
 .rail-stat svg { width: 100%; height: 32px; overflow: visible; }
+.update-result { display: grid; gap: 2px; border-top: 1px solid var(--line); padding-top: 10px; }
+.update-result p { margin: 0; color: var(--muted); font-size: .74rem; line-height: 1.5; overflow-wrap: anywhere; }
+.update-result-message { color: var(--ink); }
 .metric-chart svg { width: 100%; height: auto; overflow: visible; }
 .rail-stat polyline, .metric-chart polyline { fill: none; stroke: #9fb0b8; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
 .metric-chart .chart-axis { stroke: var(--line); stroke-width: 1; }
@@ -433,6 +452,19 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .recorder-table-disclosure summary { width: fit-content; min-height: 40px; color: var(--muted); font-size: .76rem; cursor: pointer; }
 .recorder-table-disclosure[open] summary { color: var(--ink); }
 .recorder-table-disclosure .stats-table-wrap { margin-top: 8px; }
+.recorder-table-controls { display: flex; flex-wrap: wrap; align-items: end; gap: var(--sp-3); margin-top: var(--sp-2); }
+.recorder-pager { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.recorder-page-status { color: var(--muted); font: 700 .68rem/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.recorder-live-note { grid-column: 1 / -1; margin: 0; border-top: 1px solid var(--line); padding: 9px 16px; color: var(--warn); font-size: .76rem; overflow-wrap: anywhere; }
+.recorder-live-strip > div[data-outside="true"] { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.recorder-live-strip > div[data-outside="true"] span { color: var(--warn); }
+.recorder-live-strip strong, .recorder-live-strip span { overflow-wrap: anywhere; }
+.stats-period { color: inherit; font-style: normal; }
+.stats-summary:focus-visible, .stats-block:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.stats-table.is-empty { min-width: 0; }
+.stats-table.is-empty .empty-state { white-space: normal; overflow-wrap: anywhere; }
+.stats-block-heading { flex-wrap: wrap; }
+.recorder-resolution { overflow-wrap: anywhere; text-align: right; }
 .recorder-comparison-note { min-height: 1.1em; }
 .chart-legend-comparison::before { background: #9fb0b8; }
 .recorder-table caption { padding: 10px 12px; color: var(--muted); text-align: left; font-size: .72rem; }
@@ -470,13 +502,18 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .schedule-settings { display: grid; gap: var(--sp-3); margin-top: var(--sp-7); border-top: 1px solid var(--line); padding-top: var(--sp-6); }
 .schedule-heading { margin-bottom: 0; }
 .schedule-note { max-width: 640px; }
+.schedule-timezone, .schedule-preview, #schedule-form-action { max-width: 640px; margin: 0; color: var(--muted); }
+.schedule-preview { min-height: 1.2em; }
 .schedule-list { display: grid; gap: 1px; overflow: hidden; border: 1px solid var(--line); border-radius: 4px; background: var(--line); }
 .schedule-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); padding: 12px 15px; background: var(--panel); }
 .schedule-row.is-disabled { border-left: 4px dashed var(--muted); padding-left: 11px; background: var(--raised); }
 .schedule-copy { display: grid; min-width: 0; gap: 2px; }
 .schedule-copy code { overflow-wrap: anywhere; color: var(--ink); font: 700 .82rem/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .schedule-copy strong { color: var(--muted); font-size: .78rem; font-weight: 650; }
+.schedule-copy .schedule-target { overflow-wrap: anywhere; color: var(--ink); font-size: .8rem; font-weight: 600; }
 .schedule-copy span { color: var(--muted); font-size: .74rem; }
+.schedule-discover { max-width: 720px; margin-top: var(--sp-5); justify-items: start; }
+.schedule-discover h2 { margin: 0; font-size: 1.05rem; }
 .schedule-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: var(--sp-2); }
 .schedule-toggle[aria-checked="false"] { border-style: dashed; }
 .schedule-add { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(150px, 1fr) auto; align-items: end; gap: var(--sp-2); }
@@ -510,6 +547,11 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .incident-item[data-state="resolved"] .incident-state { border-color: var(--line); color: var(--muted); }
 .incident-meta, .incident-copy { margin: 3px 0 0; color: var(--muted); font-size: .76rem; }
 .incident-copy { max-width: 760px; }
+.incident-detail { margin-top: var(--sp-2); }
+.incident-detail summary { display: inline-flex; min-height: 32px; align-items: center; cursor: pointer; color: var(--muted); font-size: .74rem; font-weight: 700; text-underline-offset: 3px; }
+.incident-detail summary:hover, .incident-detail[open] summary { color: var(--ink); }
+.incident-breakdown { max-width: 760px; border-left: 2px solid var(--line); padding: 2px 0 2px var(--sp-3); }
+.incident-breakdown p { margin: 0 0 4px; color: var(--muted); font-size: .74rem; line-height: 1.55; overflow-wrap: anywhere; }
 .incident-empty { border-left: 3px solid var(--muted); padding: var(--sp-3) var(--sp-4); color: var(--muted); background: var(--raised); font-size: .8rem; }
 .incident-empty.is-clear { border-left-color: var(--healthy); }
 .incident-empty.is-unavailable { border-left-color: var(--danger); }
@@ -565,6 +607,10 @@ dd { margin: 4px 0 0; font-weight: 700; }
   .startup-estimate-note { overflow: visible; text-overflow: clip; white-space: normal; }
   .session-facts { display: grid; align-items: start; gap: var(--sp-4); }
   .slot-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: start; gap: var(--sp-3); }
+  /* A compound label (operation · profile · next time) is wider than a phone
+     column, so it wraps instead of clipping at the deck edge. Desktop keeps the
+     single-line values and the compact session height. */
+  .slot-metrics dd { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
   .session-shortcuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .session-shortcuts a { min-height: 44px; border-left: 0; border-top: 1px solid var(--line); padding: 0; line-height: 44px; }
   .content-grid { padding-top: 28px; }

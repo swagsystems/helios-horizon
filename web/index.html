@@ -75,6 +75,7 @@
           <li data-session-phase="process" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Starting</strong><small>waiting</small></li>
           <li data-session-phase="ready" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Ready to join</strong><small>waiting</small></li>
         </ol>
+        <p class="readiness-preference">Startup timing is experimental. <a href="#/settings" data-settings-jump="startup-estimate-settings">Show the estimate in Settings</a>.</p>
         <div class="startup-estimate" id="startup-estimate" hidden>
           <div class="startup-estimate-head">
             <span class="eyebrow">Estimated progress</span>
@@ -89,6 +90,11 @@
             <span class="eyebrow">join</span>
             <code id="session-endpoint">Unavailable</code>
             <button class="button button-small button-quiet" id="session-copy-endpoint" type="button" disabled>Copy</button>
+            <details class="client-help" id="session-client-help">
+              <summary>Client setup / join help</summary>
+              <p class="client-help-runtime" id="session-client-help-runtime">Checking the current session…</p>
+              <p class="client-help-copy" id="session-client-help-copy"></p>
+            </details>
           </div>
           <dl class="slot-metrics">
             <div><dt>Players</dt><dd id="active-players">—</dd></div>
@@ -99,7 +105,7 @@
           </dl>
         </div>
         <nav class="session-shortcuts" aria-label="Session shortcuts">
-          <a id="session-activity-link" href="#/servers/minecraft/stats">Player activity</a>
+          <a id="session-activity-link" href="#/servers/minecraft/stats/players">Player activity</a>
           <a id="session-backups-link" href="#/servers/minecraft/backups">Backups</a>
           <a href="#/events">Recent events</a>
           <a href="#/audit">Audit trail</a>
@@ -208,27 +214,42 @@
                   <section class="stats-block stats-tps-block flight-recorder" aria-labelledby="stats-tps-title" aria-busy="true">
                     <div class="recorder-live-strip">
                       <div class="recorder-state"><span class="recorder-state-light" aria-hidden="true"></span><div><span>Tick signal</span><strong id="stats-live-state" role="status" aria-live="polite">Checking</strong></div></div>
-                      <div><span>TPS</span><strong id="stats-tps-current">—</strong></div>
-                      <div><span>MSPT</span><strong id="stats-mspt-current">—</strong></div>
+                      <div id="stats-tps-cell"><span>TPS</span><strong id="stats-tps-current">—</strong></div>
+                      <div id="stats-mspt-cell"><span>MSPT</span><strong id="stats-mspt-current">—</strong></div>
                       <div><span>Active / wall clock</span><strong id="stats-runtime-current">—</strong></div>
+                      <p class="recorder-live-note" id="stats-last-observed" role="status" aria-live="polite" hidden></p>
                     </div>
                     <div class="stats-block-heading"><div><h3 id="stats-tps-title">Server flight recorder</h3><p class="stats-note" id="stats-tps-note">Loading bounded telemetry…</p><p class="stats-note recorder-comparison-note" id="stats-comparison-note" role="status" aria-live="polite">No comparison selected.</p></div><span class="recorder-resolution" id="stats-effective-resolution">—</span></div>
                     <div class="recorder-canvas-wrap">
                       <canvas id="stats-tps-chart" class="stats-tps-chart" width="1040" height="440" role="img" aria-label="Server flight recorder. A table containing the same values follows."></canvas>
                     </div>
                     <ul class="stats-chart-legend" aria-label="Chart legend"><li class="chart-legend-tps">TPS</li><li class="chart-legend-mspt">MSPT</li><li class="chart-legend-resource">CPU / RSS pressure</li><li class="chart-legend-job">GC pause and backup / update / benchmark windows</li><li class="chart-legend-comparison">Selected comparison</li><li class="chart-legend-offline">Server stopped</li></ul>
-                    <details class="recorder-table-disclosure"><summary>Read recorder as a table</summary><div class="stats-table-wrap" tabindex="0"><table class="stats-table recorder-table"><caption>Bounded server telemetry samples</caption><thead><tr><th scope="col">Time</th><th scope="col">State</th><th scope="col">TPS</th><th scope="col">MSPT</th><th scope="col">Cause</th></tr></thead><tbody id="stats-recorder-table"><tr><td class="empty-state" colspan="5">No telemetry loaded yet.</td></tr></tbody></table></div></details>
+                    <details class="recorder-table-disclosure">
+                      <summary>Read recorder as a table</summary>
+                      <p class="stats-note" id="recorder-coverage">No telemetry loaded yet.</p>
+                      <div class="recorder-table-controls">
+                        <label class="stats-window">Rows per page <select id="recorder-page-size"><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+                        <label class="stats-window">Filter <select id="recorder-filter"><option value="all" selected>All samples</option><option value="available">Active only</option><option value="inactive">Inactive only</option><option value="unavailable">Unavailable only</option></select></label>
+                        <div class="recorder-pager" role="group" aria-label="Recorder table pages">
+                          <button class="button button-small button-quiet" id="recorder-prev" type="button">Previous</button>
+                          <span class="recorder-page-status" id="recorder-page-status" role="status" aria-live="polite">Page 0 of 0</span>
+                          <button class="button button-small button-quiet" id="recorder-next" type="button">Next</button>
+                        </div>
+                      </div>
+                      <div class="stats-table-wrap" tabindex="0"><table class="stats-table recorder-table"><caption>Bounded server telemetry samples</caption><thead><tr><th scope="col">Time</th><th scope="col">State</th><th scope="col">TPS</th><th scope="col">MSPT</th><th scope="col">Cause</th></tr></thead><tbody id="stats-recorder-table"><tr><td class="empty-state" colspan="5">No telemetry loaded yet.</td></tr></tbody></table></div>
+                    </details>
                   </section>
-                  <div class="stats-summary" id="stats-summary">
-                    <div><span>Total player-hours</span><strong id="stats-total-hours">—</strong></div>
-                    <div><span>Unique players</span><strong id="stats-unique-players">—</strong></div>
+                  <p class="stats-note stats-period-note" id="stats-period-note">Player totals, the leaderboard, and the heatmap cover the selected window (last 6 hours). Widen the Window control to look further back.</p>
+                  <div class="stats-summary" id="stats-summary" tabindex="-1">
+                    <div><span>Total player-hours <em class="stats-period" id="stats-total-hours-period">(last 6 hours)</em></span><strong id="stats-total-hours">—</strong></div>
+                    <div><span>Unique players <em class="stats-period" id="stats-unique-players-period">(last 6 hours)</em></span><strong id="stats-unique-players">—</strong></div>
                   </div>
                   <section class="stats-block" aria-labelledby="stats-leaderboard-title">
                     <div class="stats-block-heading"><h3 id="stats-leaderboard-title">Leaderboard</h3><span class="section-meta" id="stats-leaderboard-meta">—</span></div>
                     <div class="stats-table-wrap"><table class="stats-table"><thead><tr><th scope="col">Player</th><th scope="col">Hours</th><th scope="col">Sessions</th><th scope="col">Last seen</th></tr></thead><tbody id="stats-leaderboard"><tr><td class="empty-state" colspan="4">No sessions recorded yet.</td></tr></tbody></table></div>
                   </section>
                   <section class="stats-block" aria-labelledby="stats-heatmap-title">
-                    <div class="stats-block-heading"><h3 id="stats-heatmap-title">Activity heatmap</h3><span class="section-meta">UTC · last 90 days</span></div>
+                    <div class="stats-block-heading"><h3 id="stats-heatmap-title">Activity heatmap</h3><span class="section-meta" id="stats-heatmap-meta">UTC · last 6 hours</span></div>
                     <div class="heatmap-grid" id="stats-heatmap" aria-label="Player-hours by UTC day and hour"></div>
                   </section>
                   <section class="stats-block" id="stats-occupancy-block" aria-labelledby="stats-occupancy-title" hidden>
@@ -300,22 +321,25 @@
                 </form>
                 <details class="config-reference"><summary>Raw file reference</summary><p class="detail-footer">The raw profile-owned file remains read-only here. Only the typed settings above can be changed.</p></details>
                 <section class="schedule-settings" aria-labelledby="schedules-title">
-                  <div class="section-heading schedule-heading"><div><p class="eyebrow">automation</p><h2 id="schedules-title">Scheduled switches</h2></div><span class="section-meta">live reload</span></div>
-                  <p class="field-hint schedule-note">Scheduled switches use the normal controller flow and skip when players are online. Disabled entries stay saved but do not fire.</p>
+                  <div class="section-heading schedule-heading"><div><p class="eyebrow">automation</p><h2 id="schedules-title" tabindex="-1">Scheduled automations</h2></div><span class="section-meta">live reload</span></div>
+                  <p class="field-hint schedule-note">Every entry names the operation it runs: a backup to a destination, a profile switch, or a benchmark. They use the normal controller flow and skip when players are online. Disabled entries stay saved but do not fire.</p>
+                  <p class="field-hint schedule-timezone" id="schedule-timezone">Cron expressions are evaluated in UTC. Next runs are shown in UTC and in your local timezone.</p>
                   <div class="schedule-list" id="schedule-list"><p class="empty-state">Loading schedules…</p></div>
                   <form class="schedule-add" id="schedule-form">
                     <label for="schedule-cron">Cron</label>
-                    <input id="schedule-cron" name="cron" type="text" required maxlength="128" placeholder="0 20 * * 5" autocomplete="off">
+                    <input id="schedule-cron" name="cron" type="text" required maxlength="128" placeholder="0 20 * * 5" autocomplete="off" aria-describedby="schedule-preview">
                     <label for="schedule-profile">Server</label>
                     <select id="schedule-profile" name="profile" required></select>
-                    <button class="button button-small button-quiet" type="submit">Add schedule</button>
+                    <button class="button button-small button-quiet" id="schedule-submit" type="submit" disabled>Add profile switch</button>
+                    <p class="field-hint" id="schedule-form-action">New entries are profile switches: at the cron time Horizon switches the active server to the selected profile. Backups and benchmarks are created outside this form and keep their own operation and policy fields.</p>
+                    <p class="field-hint schedule-preview" id="schedule-preview">Cron is read in UTC. Enter five fields (minute hour day-of-month month day-of-week) to preview the next run before adding it.</p>
                     <p class="field-hint" id="schedule-status" aria-live="polite"></p>
                   </form>
                 </section>
               </section>
             </div>
             <aside class="detail-rail" aria-label="Live server summary">
-              <section class="rail-card"><h2>Live rail</h2><div class="rail-stat"><span>CPU</span><strong id="rail-cpu">—</strong><div class="capacity-track" id="rail-cpu-capacity" aria-label="CPU capacity"><i></i></div><p id="rail-cpu-note">Capacity unavailable</p></div><div class="rail-stat"><span>Memory RSS</span><strong id="rail-memory">—</strong><div class="capacity-track" id="rail-memory-capacity" aria-label="Memory capacity"><i></i></div><p id="rail-memory-note">Capacity unavailable</p></div><div class="rail-stat"><span>Players</span><strong id="rail-players">—</strong><p id="rail-players-note"></p></div><div class="rail-stat"><span>Version</span><strong id="rail-version">—</strong><p id="rail-version-note"></p></div><button class="button button-small button-quiet" id="check-update" type="button">Check for updates</button></section>
+              <section class="rail-card"><h2>Live rail</h2><div class="rail-stat"><span>CPU</span><strong id="rail-cpu">—</strong><div class="capacity-track" id="rail-cpu-capacity" aria-label="CPU capacity"><i></i></div><p id="rail-cpu-note">Capacity unavailable</p></div><div class="rail-stat"><span>Memory RSS</span><strong id="rail-memory">—</strong><div class="capacity-track" id="rail-memory-capacity" aria-label="Memory capacity"><i></i></div><p id="rail-memory-note">Capacity unavailable</p></div><div class="rail-stat"><span>Players</span><strong id="rail-players">—</strong><p id="rail-players-note"></p></div><div class="rail-stat"><span>Version</span><strong id="rail-version">—</strong><p id="rail-version-note"></p></div><button class="button button-small button-quiet" id="check-update" type="button">Check for updates</button><div class="update-result" id="update-result" role="status" aria-live="polite"><p class="update-result-message" id="update-result-message">Not checked in this tab yet.</p><p class="update-result-time" id="update-result-time" hidden></p></div></section>
             </aside>
           </div>
         </section>
@@ -359,13 +383,21 @@
               <option value="paper">Paper</option>
             </select>
           </div>
-          <section class="settings-panel startup-estimate-settings" aria-labelledby="startup-estimate-settings-title">
+          <section class="settings-panel startup-estimate-settings" id="startup-estimate-settings" aria-labelledby="startup-estimate-settings-title">
             <div>
               <p class="eyebrow">experimental</p>
               <h2 id="startup-estimate-settings-title">Startup estimate</h2>
               <p class="field-hint">Shows an estimated startup track on the current session using this controller's recent successful start durations. The setting is stored in this browser only.</p>
             </div>
-            <label class="check-row" for="startup-estimate-toggle"><input id="startup-estimate-toggle" type="checkbox"> Experimental startup estimate</label>
+            <label class="check-row" for="startup-estimate-toggle"><input id="startup-estimate-toggle" type="checkbox" data-settings-target="startup-estimate-settings"> Experimental startup estimate</label>
+          </section>
+          <section class="settings-panel schedule-discover" aria-labelledby="settings-schedules-title">
+            <div>
+              <p class="eyebrow">automation</p>
+              <h2 id="settings-schedules-title">Scheduled automations</h2>
+              <p class="field-hint">Backups, profile switches and benchmarks are scheduled per server. Each entry names its operation and shows its next run in UTC and your local timezone.</p>
+            </div>
+            <a class="button button-small button-quiet" id="settings-schedules-link" href="#/settings">Open scheduled automations</a>
           </section>
           <section class="settings-panel performance-panel" id="performance-panel" aria-labelledby="performance-title">
             <div><p class="eyebrow">measure first</p><h2 id="performance-title">Performance</h2><p class="field-hint">Read-only snapshot from the web tier and slot daemon. Loaded when this page opens; no polling.</p></div>
@@ -412,14 +444,14 @@
       <form method="dialog" class="dialog-form" id="switch-form" novalidate>
         <div class="dialog-header">
           <div><p class="eyebrow">Confirmation required</p><h2 id="switch-dialog-title">Switch active server</h2></div>
-          <button class="icon-button" value="cancel" aria-label="Close switch dialog">×</button>
+          <button class="icon-button" type="button" value="cancel" data-dialog-close aria-label="Close switch dialog">×</button>
         </div>
         <div class="dialog-body">
           <div class="summary-list">
-            <div><span>Current server</span><strong id="switch-current">—</strong></div>
-            <div><span>Target server</span><strong id="switch-target-summary">—</strong></div>
+            <div><span>Current server (running, owns the active slot)</span><strong id="switch-current">—</strong></div>
+            <div><span>Selected target (starts after the switch)</span><strong id="switch-target-summary">—</strong></div>
             <div><span>Expected maximum downtime</span><strong id="switch-timeout">—</strong></div>
-            <div><span>Last backup</span><strong id="switch-backup">No recent backup recorded</strong></div>
+            <div><span id="switch-backup-owner">Last backup</span><strong id="switch-backup">No source backup needed — no server is running</strong></div>
           </div>
           <label for="switch-target">Target profile</label>
           <select id="switch-target" name="target" required></select>
@@ -428,10 +460,11 @@
           <label class="check-row"><input id="switch-rollback-option" type="checkbox" checked> Roll back if the target fails health checks</label>
           <label for="switch-confirm-text">Type the target profile name to confirm</label>
           <input id="switch-confirm-text" autocomplete="off" inputmode="text" required>
+          <p class="field-hint" id="switch-consequence">With no server running, confirming just sends a start request for the selected target. Otherwise switching stops the running server, then starts the selected target; each profile keeps its own world data.</p>
           <p class="field-hint" id="switch-hint">Enter the target name exactly as shown.</p>
         </div>
         <div class="dialog-actions sticky-actions">
-          <button class="button button-quiet" value="cancel">Cancel</button>
+          <button class="button button-quiet" type="button" value="cancel" data-dialog-close>Cancel</button>
           <button class="button button-primary" id="switch-confirm" value="default" disabled>Confirm switch</button>
         </div>
       </form>
@@ -439,19 +472,19 @@
 
     <dialog class="dialog" id="force-dialog" aria-labelledby="force-dialog-title">
       <form method="dialog" class="dialog-form" id="force-form">
-        <div class="dialog-header"><div><p class="eyebrow">Last resort</p><h2 id="force-dialog-title">Force stop server</h2></div><button class="icon-button" value="cancel" aria-label="Close force stop dialog">×</button></div>
+        <div class="dialog-header"><div><p class="eyebrow">Last resort</p><h2 id="force-dialog-title">Force stop server</h2></div><button class="icon-button" type="button" value="cancel" data-dialog-close aria-label="Close force stop dialog">×</button></div>
         <div class="dialog-body">
           <p id="force-description">This interrupts the server without waiting for a clean shutdown.</p>
           <label for="force-confirm-text">Type the profile name to confirm</label>
           <input id="force-confirm-text" autocomplete="off" required>
         </div>
-        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-danger" id="force-confirm" value="default" disabled>Force stop</button></div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" type="button" value="cancel" data-dialog-close>Cancel</button><button class="button button-danger" id="force-confirm" value="default" disabled>Force stop</button></div>
       </form>
     </dialog>
 
     <dialog class="dialog dialog-wide" id="logs-dialog" aria-labelledby="logs-dialog-title">
       <form method="dialog" class="dialog-form" id="logs-form">
-        <div class="dialog-header"><div><p class="eyebrow">Live stream</p><h2 id="logs-dialog-title">Logs</h2></div><button class="icon-button" value="cancel" aria-label="Close logs dialog">×</button></div>
+        <div class="dialog-header"><div><p class="eyebrow">Live stream</p><h2 id="logs-dialog-title">Logs</h2></div><button class="icon-button" type="button" value="cancel" data-dialog-close aria-label="Close logs dialog">×</button></div>
         <div class="dialog-body">
           <div class="log-toolbar">
             <label for="log-query">Search logs</label><input id="log-query" type="search" placeholder="Filter messages">
@@ -460,25 +493,25 @@
           </div>
           <ol class="log-list" id="log-list"><li class="empty-state">No log lines loaded.</li></ol>
         </div>
-        <div class="dialog-actions sticky-actions"><button class="button button-primary" value="cancel">Done</button></div>
+        <div class="dialog-actions sticky-actions"><button class="button button-primary" type="button" value="cancel" data-dialog-close>Done</button></div>
       </form>
     </dialog>
 
     <dialog class="dialog" id="restore-dialog" aria-labelledby="restore-dialog-title">
       <form method="dialog" class="dialog-form" id="restore-form">
-        <div class="dialog-header"><div><p class="eyebrow">Data replacement</p><h2 id="restore-dialog-title">Restore backup</h2></div><button class="icon-button" value="cancel" aria-label="Close restore dialog">×</button></div>
+        <div class="dialog-header"><div><p class="eyebrow">Data replacement</p><h2 id="restore-dialog-title">Restore backup</h2></div><button class="icon-button" type="button" value="cancel" data-dialog-close aria-label="Close restore dialog">×</button></div>
         <div class="dialog-body">
-          <p id="restore-description">Restoring replaces the selected profile's world data.</p>
+          <p id="restore-description">Restoring replaces the selected profile's world data with the chosen backup. The server must be stopped first: Horizon refuses a restore while it is running and does not stop it for you. It creates a protected backup of the current world under this profile before replacing anything, so the state being replaced stays recoverable; changes made after the chosen backup are not in the restored world, and you start the server again yourself once the restore finishes.</p>
           <label for="restore-backup-id">Backup ID</label><input id="restore-backup-id" required pattern="(?:[A-Za-z0-9_]|-){1,128}">
           <label for="restore-confirm-text">Type the profile name to confirm</label><input id="restore-confirm-text" autocomplete="off" required>
         </div>
-        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel" formnovalidate>Cancel</button><button class="button button-danger" id="restore-confirm" value="default" disabled>Restore backup</button></div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" type="button" value="cancel" data-dialog-close>Cancel</button><button class="button button-danger" id="restore-confirm" value="default" disabled>Restore backup</button></div>
       </form>
     </dialog>
 
     <dialog class="dialog" id="update-dialog" aria-labelledby="update-dialog-title">
       <form method="dialog" class="dialog-form" id="update-form">
-        <div class="dialog-header"><div><p class="eyebrow">Review required</p><h2 id="update-dialog-title">Apply server update</h2></div><button class="icon-button" value="cancel" aria-label="Close update dialog">×</button></div>
+        <div class="dialog-header"><div><p class="eyebrow">Review required</p><h2 id="update-dialog-title">Apply server update</h2></div><button class="icon-button" type="button" value="cancel" data-dialog-close aria-label="Close update dialog">×</button></div>
         <div class="dialog-body">
           <p id="update-description">Horizon found an update. Review the version change before applying it.</p>
           <div class="summary-list">
@@ -488,14 +521,14 @@
           </div>
           <p class="field-hint">Applying an update uses the profile's reviewed update strategy and may require the server to remain stopped. Horizon will reject the request if its safety gates are not satisfied.</p>
         </div>
-        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-primary" id="update-confirm" value="default">Apply update</button></div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" type="button" value="cancel" data-dialog-close>Cancel</button><button class="button button-primary" id="update-confirm" value="default">Apply update</button></div>
       </form>
     </dialog>
 
     <div class="sr-only" id="status-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
     <dialog class="dialog" id="console-save-as-dialog" aria-labelledby="console-save-as-title">
       <form method="dialog" class="dialog-form" id="console-save-as-form">
-        <div class="dialog-header"><div><p class="eyebrow">Export console</p><h2 id="console-save-as-title">Save console range</h2></div><button class="icon-button" value="cancel" aria-label="Close export dialog">×</button></div>
+        <div class="dialog-header"><div><p class="eyebrow">Export console</p><h2 id="console-save-as-title">Save console range</h2></div><button class="icon-button" type="button" value="cancel" data-dialog-close aria-label="Close export dialog">×</button></div>
         <div class="dialog-body">
           <label class="check-row"><input id="console-export-timestamps" type="checkbox" checked> Include timestamps and severity</label>
           <label for="console-export-severity">Severity</label><select id="console-export-severity"><option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option></select>
@@ -503,7 +536,7 @@
           <label for="console-export-to">To</label><input id="console-export-to" type="datetime-local">
           <p class="field-hint">Leave both times empty to export the current console buffer.</p>
         </div>
-        <div class="dialog-actions sticky-actions"><button class="button button-quiet" value="cancel">Cancel</button><button class="button button-primary" id="console-export-submit" value="default">Save</button></div>
+        <div class="dialog-actions sticky-actions"><button class="button button-quiet" type="button" value="cancel" data-dialog-close>Cancel</button><button class="button button-primary" id="console-export-submit" value="default">Save</button></div>
       </form>
     </dialog>
     <script src="/app.js" type="module"></script>

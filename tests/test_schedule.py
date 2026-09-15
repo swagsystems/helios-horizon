@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 import asyncio
 import logging
+import tomllib
 
 import pytest
 
@@ -464,3 +465,66 @@ def test_schedule_rpc_rejects_invalid_cron_and_unknown_profile(tmp_path):
     with pytest.raises(ValidationError, match="backup schedules require a destination"):
         SetSchedules(kind="set_schedules", entries=({"cron": "0 3 * * *", "profile": "minecraft", "operation": "backup"},))
     assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_schedule_view_exposes_policy_fields_that_survive_an_unrelated_edit(tmp_path):
+    """The read view must carry benchmark policy so a later edit cannot drop it."""
+    controller = Controller.for_testing(tmp_path)
+    controller.profiles = {
+        ProfileId.MINECRAFT: SimpleNamespace(id=ProfileId.MINECRAFT),
+        ProfileId.PZ_RISING: SimpleNamespace(id=ProfileId.PZ_RISING),
+    }
+    config_path = tmp_path / "game-control.toml"
+    controller.schedule_config_path = config_path
+    config_path.write_text('profiles_dir = "profiles.d"\n', encoding="utf-8")
+    benchmark = {
+        "cron": "40 3 * * *",
+        "profile": "minecraft",
+        "enabled": False,
+        "operation": "benchmark",
+        "baseline_preset": "baseline",
+        "candidate_preset": "candidate",
+        "campaign": "weekly",
+        "maintenance_window": True,
+        "rollback_safe": True,
+        "public_wake_policy": "safe",
+    }
+    written = controller.execute_sync(RpcRequest(
+        request_id=uuid4(), actor="operator",
+        action=SetSchedules(kind="set_schedules", entries=(
+            benchmark,
+            {"cron": "10 3 * * *", "profile": "pz-rising", "backup_destination": "horizon-b2"},
+        )),
+    ))
+    assert written.ok is True
+    listed = controller.execute_sync(RpcRequest(
+        request_id=uuid4(), actor="operator", action=GetSchedules(kind="get_schedules"),
+    ))
+    view = listed.result.schedules[0]
+    assert view.operation == "benchmark"
+    assert view.maintenance_window is True
+    assert view.rollback_safe is True
+    assert view.public_wake_policy == "safe"
+    assert view.campaign == "weekly"
+
+    # A client that round-trips exactly what the view reported (the old view
+    # omitted the three policy fields) keeps the stored policy intact.
+    entries = [
+        item.model_dump(mode="json", exclude_none=True, exclude={"next_fire"})
+        for item in listed.result.schedules
+    ]
+    entries[1]["enabled"] = False
+    replaced = controller.execute_sync(RpcRequest(
+        request_id=uuid4(), actor="operator",
+        action=SetSchedules(kind="set_schedules", entries=tuple(entries)),
+    ))
+    assert replaced.ok is True
+    stored = tomllib.loads(config_path.read_text(encoding="utf-8"))["schedule"]
+    persisted = next(item for item in stored if item["profile"] == "minecraft")
+    assert persisted["operation"] == "benchmark"
+    assert persisted["maintenance_window"] is True
+    assert persisted["rollback_safe"] is True
+    assert persisted["public_wake_policy"] == "safe"
+    assert persisted["campaign"] == "weekly"
+    assert persisted["baseline_preset"] == "baseline"
+    assert persisted["candidate_preset"] == "candidate"

@@ -50,16 +50,20 @@ def schedule_page(web_server):
 
 def test_schedule_list_add_and_remove_contract(schedule_page: Page):
     page = schedule_page
-    assert page.get_by_role("heading", name="Scheduled switches", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Scheduled automations", exact=True).is_visible()
     expect(page.locator("#schedule-list [data-schedule-row]")).to_have_count(1)
     assert page.get_by_text("next: Fri, Jul 17", exact=False).is_visible()
+    # The row names the operation it runs, not just the cron and the target.
+    assert page.locator("[data-schedule-row]").first.get_attribute("data-schedule-operation") == "switch"
+    assert page.get_by_text("Profile switch", exact=True).is_visible()
+    assert "evaluated in UTC" in page.locator("#schedule-timezone").inner_text()
     status = page.locator("#schedule-status")
     assert page.locator(".schedule-settings [aria-live='polite']").count() == 1
     assert page.locator("#schedule-list").get_attribute("aria-live") is None
     assert status.inner_text() == "Schedule changes apply without restarting Horizon."
 
     page.get_by_label("Cron", exact=True).fill("15 9 * * 1")
-    page.get_by_role("button", name="Add schedule", exact=True).click()
+    page.get_by_role("button", name="Add profile switch", exact=True).click()
     expect(page.locator("#schedule-list [data-schedule-row]")).to_have_count(2)
     assert page.get_by_text("15 9 * * 1", exact=True).is_visible()
     assert status.inner_text() == "Schedule changes applied live."

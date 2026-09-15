@@ -1,3 +1,6 @@
+import json
+import shutil
+import subprocess
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,6 +10,7 @@ from starlette.requests import Request
 
 from game_control.protocol import GetPerf, PerfSnapshot, RpcSuccess, StatusSnapshot
 from game_control.perf import PerformanceTracker
+from game_control.schedule import parse_schedule
 from game_control.web_main import BoundedTimingRing, EventHub, create_app
 
 
@@ -56,14 +60,105 @@ def test_phase_zero_web_client_uses_visibility_gated_incremental_paths():
     assert "resolution=${encodeURIComponent(resolution)}&limit=720" in app
 
 
-def test_schedule_ui_preserves_operation_and_policy_fields():
+def _schedule_payload_probe(items: list[dict]) -> list[dict]:
+    """Run the shipped ``schedulePayload`` in node against real view objects."""
     app = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text()
-    assert "function schedulePayload(item)" in app
-    assert "item.operation" in app
-    assert "item.maintenance_window === true" in app
-    assert "item.rollback_safe === true" in app
-    assert 'item.public_wake_policy || "disabled"' in app
-    assert 'operation: "switch"' in app
+    start = app.index("function schedulePayload(item) {")
+    end = app.index("\n}\n", start) + len("\n}\n")
+    source = f"""
+{app[start:end]}
+const items = {json.dumps(items)};
+console.log(JSON.stringify(items.map((item) => schedulePayload(item))));
+"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the schedule payload probe")
+    result = subprocess.run([node, "-e", source], check=True, capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+
+def test_schedule_ui_preserves_operation_and_policy_fields():
+    """Whole-book replacement must re-emit every stored field unchanged.
+
+    The exact payload is asserted (no coercion, no injected defaults and no
+    inference), and the emitted entries are then fed to the controller's own
+    parser so policy coverage is proven behaviourally, not by string matching.
+    """
+    view = [
+        {
+            "cron": "10 3 * * *",
+            "profile": "minecraft",
+            "next_fire": "2026-09-16T03:10:00Z",
+            "enabled": True,
+            "operation": "backup",
+            "backup_destination": "horizon-b2",
+        },
+        {
+            "cron": "20 3 * * *",
+            "profile": "terraria-vanilla",
+            "next_fire": "2026-09-16T03:20:00Z",
+            "enabled": False,
+            "operation": "switch",
+        },
+        {
+            "cron": "40 3 * * *",
+            "profile": "terraria-tmod",
+            "next_fire": None,
+            "enabled": False,
+            "operation": "benchmark",
+            "baseline_preset": "baseline",
+            "candidate_preset": "candidate",
+            "campaign": "weekly",
+            "maintenance_window": True,
+            "rollback_safe": True,
+            "public_wake_policy": "safe",
+        },
+    ]
+    assert _schedule_payload_probe(view) == [
+        {
+            "cron": "10 3 * * *",
+            "profile": "minecraft",
+            "enabled": True,
+            "operation": "backup",
+            "backup_destination": "horizon-b2",
+        },
+        {
+            "cron": "20 3 * * *",
+            "profile": "terraria-vanilla",
+            "enabled": False,
+            "operation": "switch",
+        },
+        {
+            "cron": "40 3 * * *",
+            "profile": "terraria-tmod",
+            "enabled": False,
+            "operation": "benchmark",
+            "baseline_preset": "baseline",
+            "candidate_preset": "candidate",
+            "campaign": "weekly",
+            "maintenance_window": True,
+            "rollback_safe": True,
+            "public_wake_policy": "safe",
+        },
+    ]
+
+    # A legacy view omits ``operation``; nothing is invented for it, and the
+    # controller infers the same operation it inferred before the edit.
+    legacy = [{"cron": "0 20 * * 5", "profile": "minecraft", "next_fire": "2026-09-18T20:00:00Z", "enabled": True}]
+    assert _schedule_payload_probe(legacy) == [
+        {"cron": "0 20 * * 5", "profile": "minecraft", "enabled": True},
+    ]
+
+    parsed = parse_schedule(_schedule_payload_probe(view))
+    assert parsed[0].operation == "backup" and parsed[0].backup_destination.value == "horizon-b2"
+    assert parsed[1].operation == "switch" and parsed[1].enabled is False
+    assert parsed[2].operation == "benchmark"
+    assert parsed[2].maintenance_window is True
+    assert parsed[2].rollback_safe is True
+    assert parsed[2].public_wake_policy == "safe"
+    assert parsed[2].campaign == "weekly"
+    assert parsed[2].baseline_preset == "baseline" and parsed[2].candidate_preset == "candidate"
+    assert parse_schedule(_schedule_payload_probe(legacy))[0].operation == "switch"
 
 
 def test_session_expiry_is_single_flight_and_stops_reconnect_without_misclassifying_403():

@@ -242,6 +242,12 @@ class ScheduleView(RpcModel):
     baseline_preset: str | None = None
     candidate_preset: str | None = None
     campaign: str | None = None
+    # Editing a schedule replaces the whole book, so the read view has to carry
+    # every policy field a benchmark entry stores; otherwise an unrelated edit
+    # would silently drop them.
+    maintenance_window: bool = False
+    rollback_safe: bool = False
+    public_wake_policy: Literal["disabled", "safe"] = "disabled"
 
 
 class ScheduleResponse(RpcModel):

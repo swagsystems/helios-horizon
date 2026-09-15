@@ -39,6 +39,10 @@ const state = {
   actor: null,
   csrf: null,
   profiles: new Map(),
+  // Profile ids the controller actually reports. Fallback placeholders are kept
+  // renderable but never gain lifecycle controls; the last confirmed set
+  // survives a transient profiles/status failure.
+  configuredProfiles: new Set(),
   statuses: new Map(),
   selectedProfile: null,
   dialog: null,
@@ -46,8 +50,15 @@ const state = {
   drawerReturnFocus: null,
   forceProfile: null,
   restoreProfile: null,
+  switchBackup: null,
+  dialogGeneration: 0,
   updateProfile: null,
+  focusSchedules: false,
   updateApplySupported: false,
+  // Per-profile update-check state. Results stay in memory for this page
+  // session only, so a tab switch back to a profile shows the same result
+  // without re-querying or pretending a fresh check happened.
+  updates: new Map(),
   logs: new Map(),
   cpuSamples: new Map(),
   metricSamples: new Map(),
@@ -57,7 +68,7 @@ const state = {
   incidents: { items: [], loaded: false },
   benchmarks: new Map(),
   session: { profileId: null, latestBackup: null, backupState: "loading", operation: null },
-  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsAbort: null, metricTimer: null, metricRequest: 0, metricAbort: null, benchmarkTimer: null, benchmarkCursor: null, benchmarkRuns: [], statsBaseLoaded: false, commandCatalogKey: null, configRequest: 0 },
+  detail: { id: null, tab: "console", backups: [], statsTimer: null, statsRequest: 0, statsAbort: null, metricTimer: null, metricRequest: 0, metricAbort: null, benchmarkTimer: null, benchmarkCursor: null, benchmarkRuns: [], statsBaseLoaded: false, statsBaseWindow: null, statsShownWindow: null, statsShownProfile: null, statsTracking: null, focusSection: null, commandCatalogKey: null, configRequest: 0 },
   statsCache: new Map(),
   configRestartRequired: new Map(),
   lastGeneration: 0,
@@ -147,6 +158,7 @@ async function flushClientPerformance() {
 const byId = (id) => document.getElementById(id);
 const cards = byId("profile-cards");
 const announcer = byId("status-announcer");
+const detailViewActive = () => !byId("detail-view")?.hidden;
 const profileLabel = (id) => state.profiles.get(id)?.display_name || id;
 const titleCase = (value) => String(value || "unknown").replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 const statusLabel = (value) => {
@@ -211,12 +223,52 @@ function updateServerNav() {
       nav.append(item);
     }
     const label = item.querySelector("[data-profile-label]");
-    if (label) label.textContent = profile?.display_name || id;
+    const configured = profileIsConfigured(id);
+    const display = profile?.display_name || id;
+    if (label) label.textContent = configured ? display : `${display} · not configured`;
+    item.classList.toggle("is-unavailable", !configured);
+    item.setAttribute("aria-label", configured ? `Open ${display} console` : `${display} is not configured on this controller`);
+    if (configured) item.removeAttribute("aria-disabled"); else item.setAttribute("aria-disabled", "true");
     const ownerStatus = owner === id ? state.statuses.get(id) : null;
     const dot = item.querySelector(".server-dot");
     dot?.classList.toggle("is-owner", owner === id);
     dot?.classList.toggle("is-transitional", ["starting", "stopping"].includes(ownerStatus?.state));
   });
+  updateSchedulesLink();
+}
+
+function profileIsConfigured(id) {
+  return state.configuredProfiles.has(String(id));
+}
+
+function schedulesProfileId() {
+  const owner = slotOwnerId();
+  if (owner && profileIsConfigured(owner)) return owner;
+  const session = sessionProfileId();
+  if (session && profileIsConfigured(session)) return session;
+  return [...state.configuredProfiles][0] || null;
+}
+
+function schedulesRoute() {
+  const id = schedulesProfileId();
+  return id ? detailTabUrl(id, "config") : "#/settings";
+}
+
+function openSchedules() {
+  state.focusSchedules = true;
+  const target = schedulesRoute();
+  // Re-anchor when the config tab is already open, otherwise the hash change
+  // would not fire and the section would never be revealed.
+  if (window.location.hash === target) renderSchedules();
+  else window.location.hash = target;
+}
+
+function updateSchedulesLink() {
+  const link = byId("settings-schedules-link");
+  if (!link) return;
+  const id = schedulesProfileId();
+  link.href = schedulesRoute();
+  link.setAttribute("aria-label", id ? `Open scheduled automations for ${profileLabel(id)}` : "Open scheduled automations");
 }
 
 function setDrawer(open, returnFocus = null) {
@@ -486,6 +538,68 @@ function formatVersion(version) {
   return sentinel.includes(value.toLowerCase()) ? "—" : value;
 }
 
+const UPDATE_TASK_LABELS = {
+  check: "Update check",
+  automatic: "Automatic update check",
+};
+
+function updateTaskLabel(entry) {
+  return UPDATE_TASK_LABELS[entry?.task] || UPDATE_TASK_LABELS.check;
+}
+
+function updateCheckedAt(entry) {
+  if (!entry?.status) return null;
+  const parsed = Date.parse(entry.status.checked_at || "");
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function updateTimeHint(entry) {
+  const parts = [];
+  const checked = updateCheckedAt(entry);
+  if (checked) parts.push(`${updateTaskLabel(entry)} ran ${new Date(checked).toLocaleString()}`);
+  if (entry?.fetchedAt) parts.push(`result retrieved ${new Date(entry.fetchedAt).toLocaleString()}`);
+  return parts.join(" · ");
+}
+
+function updateResultText(entry) {
+  const label = updateTaskLabel(entry);
+  if (entry?.pending) return `${label} in progress…`;
+  if (!entry) return "Not checked in this tab yet.";
+  if (entry.error) return `${label} request failed. ${entry.error}`;
+  const status = entry.status || {};
+  const state = status.state || (status.available_version ? "available" : "unknown");
+  if (!status.message && state === "available") {
+    const available = formatVersion(status.available_version);
+    const installed = formatVersion(status.installed_version);
+    return installed === "—"
+      ? `Update ${available} is available; installed version unknown.`
+      : `Update ${available} is available; installed version is ${installed}.`;
+  }
+  const fallback = {
+    failed: "The controller could not complete the check.",
+    checking: "The controller is still running the check.",
+    unsupported: "Update checks are not supported for this profile.",
+    deferred: "The automatic update is deferred until its safe stopped window.",
+    stale: "This result is older than the controller's freshness window.",
+    current: "No update available.",
+    unknown: "The controller did not report a supported update state.",
+  }[state];
+  return status.message || fallback || "The controller reported an update state this page does not recognize.";
+}
+
+function renderUpdateCheckResult(id) {
+  const messageNode = byId("update-result-message");
+  if (!messageNode || !id || state.detail.id !== id) return;
+  const entry = state.updates.get(id) || null;
+  const stale = entry?.fetchedAt ? Date.now() - entry.fetchedAt > 900000 : false;
+  messageNode.textContent = stale && !entry.pending ? `${updateResultText(entry)} (last result in this tab)` : updateResultText(entry);
+  const timeNode = byId("update-result-time");
+  if (!timeNode) return;
+  const hint = entry && !entry.pending ? updateTimeHint(entry) : "";
+  timeNode.textContent = hint;
+  timeNode.hidden = !hint;
+}
+
 function createCard(id) {
   const card = document.createElement("article");
   card.className = "profile-card";
@@ -572,7 +686,11 @@ function renderCards() {
     }
     const card = cards.querySelector(`[data-profile-id="${CSS.escape(id)}"]`) || createCard(id);
     section.querySelector(".profile-family-cards").append(card);
-    patchCard(id);
+    // The family section is still detached here, so patch the element itself
+    // instead of re-querying a card the document cannot see yet.  Profiles with
+    // no status entry (unconfigured placeholders) would otherwise stay a blank
+    // template with live-looking lifecycle buttons.
+    patchCard(id, card);
   });
   const orderedSections = PROFILE_FAMILY_RULES.map((rule) => sections.get(rule.key)).filter(Boolean);
   if (sections.has("other")) orderedSections.push(sections.get("other"));
@@ -611,11 +729,44 @@ function patchSparkline(card, id, status) {
   );
 }
 
-function patchCard(id) {
-  const card = cards.querySelector(`[data-profile-id="${CSS.escape(id)}"]`) || createCard(id);
+function patchCard(id, target = null) {
+  const card = target || cards.querySelector(`[data-profile-id="${CSS.escape(id)}"]`) || createCard(id);
   const profile = state.profiles.get(id) || { id, display_name: id, operations: [] };
   const status = state.statuses.get(id) || { profile_id: id, state: "unknown", health: "unknown" };
   const display = profile.display_name || id;
+  if (!profileIsConfigured(id)) {
+    // A placeholder id (or a profile the controller no longer reports) stays
+    // visible and clearly named, without lifecycle controls that cannot work.
+    card.classList.add("is-unavailable");
+    card.querySelector(".profile-kicker").textContent = id;
+    card.querySelector(".profile-name").textContent = display;
+    card.querySelector(".profile-description").textContent = "Not configured on this controller";
+    card.querySelector(".status-badge").className = "status-badge state-unknown";
+    card.querySelector(".status-text").textContent = "Not configured";
+    card.querySelector(".metric-players").textContent = "—";
+    card.querySelector(".metric-cpu").textContent = "—";
+    card.querySelector(".metric-memory").textContent = "—";
+    card.querySelector(".metric-version").textContent = "—";
+    card.querySelector(".card-reason").textContent = "Horizon has no configuration for this profile, so start, stop, restart and switch stay unavailable.";
+    const sparkline = card.querySelector(".cpu-sparkline-line");
+    sparkline.setAttribute("points", "0,36 120,36");
+    card.querySelector(".cpu-sparkline").setAttribute("aria-label", "CPU usage unavailable");
+    [".action-start", ".action-stop", ".action-restart"].forEach((selector) => {
+      const button = card.querySelector(selector);
+      button.hidden = true;
+      button.disabled = true;
+      button.setAttribute("aria-label", `${button.textContent} ${display} (not configured)`);
+    });
+    const unavailableSwitch = card.querySelector(".action-switch");
+    unavailableSwitch.hidden = true;
+    unavailableSwitch.disabled = true;
+    unavailableSwitch.title = "This profile is not configured on this controller.";
+    unavailableSwitch.setAttribute("aria-label", `Switch to ${display} (not configured)`);
+    card.querySelector(".manage-link").hidden = true;
+    updateServerNav();
+    return;
+  }
+  card.classList.remove("is-unavailable");
   const rawCurrent = status.state || "unknown";
   const ownUpdate = updateActive(status);
   const ownerUpdate = updateOwner();
@@ -664,12 +815,14 @@ function patchCard(id) {
     button.title = button.disabled ? (why || "Action is unavailable in this state.") : "";
   });
   const switchButton = card.querySelector(".action-switch");
+  switchButton.hidden = false;
   switchButton.disabled = status.slot_owner === id || updating;
   switchButton.setAttribute("aria-label", `Switch to ${display}`);
   switchButton.title = switchButton.disabled
     ? (updating ? "An update is in progress; switching is paused." : "This server already owns the active slot.")
     : "Preselect this server in the switch dialog.";
   const manage = card.querySelector(".manage-link");
+  manage.hidden = false;
   manage.href = `#/servers/${encodeURIComponent(id)}/console`;
   manage.setAttribute("aria-label", `Manage ${display}`);
   updateServerNav();
@@ -692,6 +845,7 @@ function patchActiveSlot() {
     byId("active-health").textContent = "—";
     byId("session-endpoint").textContent = "Unavailable";
     byId("session-copy-endpoint").disabled = true;
+    renderSessionClientHelp(null, null);
     primary.textContent = "Retry status";
     primary.dataset.sessionAction = "retry";
     primary.disabled = false;
@@ -709,6 +863,7 @@ function patchActiveSlot() {
   byId("session-endpoint").textContent = endpoint || "Unavailable";
   copy.dataset.endpoint = endpoint || "";
   copy.setAttribute("aria-label", `Copy ${name} join address`);
+  renderSessionClientHelp(profile, target);
   const offline = lifecycleOffline(target);
   const updating = updateActive(target);
   byId("active-players").textContent = offline ? "Offline" : target.players_online == null ? "Not observed" : String(target.players_online);
@@ -718,7 +873,7 @@ function patchActiveSlot() {
   slot.classList.toggle("is-transitional", ["starting", "stopping"].includes(target.state) || updating);
   manage.href = `#/servers/${encodeURIComponent(targetId)}/console`;
   manage.setAttribute("aria-label", `Manage ${name}`);
-  byId("session-activity-link").href = `#/servers/${encodeURIComponent(targetId)}/stats`;
+  byId("session-activity-link").href = `#/servers/${encodeURIComponent(targetId)}/stats/players`;
   byId("session-backups-link").href = `#/servers/${encodeURIComponent(targetId)}/backups`;
   const model = sessionModel(target, ownerId, targetId, endpoint);
   manage.hidden = model.action === "console";
@@ -755,6 +910,42 @@ function sessionEndpoint(profile) {
   if (!host) return "";
   const port = Number(endpoint?.port);
   return Number.isInteger(port) && port > 0 && port !== 25565 ? `${host}:${port}` : String(host);
+}
+
+const CLIENT_SETUP_COPY = {
+  minecraft: "Install the matching Minecraft launcher profile and sync the current modpack build before joining.",
+  "terraria-vanilla": "Install the same Terraria version this profile runs, then join from that client.",
+  "terraria-tmod": "Install the same Terraria and tModLoader versions this profile runs, then join from that client.",
+  "project-zomboid": "Install the same Project Zomboid build this profile runs, with the matching client mods.",
+  other: "Install the same game build and modpack versions this profile runs before joining.",
+};
+
+function clientSetupKey(profile) {
+  const family = profileFamily(profile);
+  if (family.key !== "terraria") return family.key;
+  const id = String(profile?.id ?? "");
+  const name = String(profile?.display_name ?? "");
+  return /tmod/i.test(`${id} ${name}`) ? "terraria-tmod" : "terraria-vanilla";
+}
+
+function renderSessionClientHelp(profile, status) {
+  const runtimeNode = byId("session-client-help-runtime");
+  const copyNode = byId("session-client-help-copy");
+  if (!runtimeNode || !copyNode) return;
+  // The detail status does not carry the adapter, so resolve the family from
+  // the loaded profile list when the caller only has the status projection.
+  const adapter = profile?.adapter ?? state.profiles.get(profile?.id)?.adapter ?? profile?.id ?? "";
+  const resolved = profile ? { ...profile, adapter } : profile;
+  copyNode.textContent = CLIENT_SETUP_COPY[clientSetupKey(resolved)] || CLIENT_SETUP_COPY.other;
+  if (!profile) {
+    runtimeNode.textContent = "Runtime versions appear once Horizon identifies the current session.";
+    return;
+  }
+  const label = profile.display_name || profileLabel(profile.id) || profile.id;
+  const version = formatVersion(status?.installed_version);
+  runtimeNode.textContent = version === "—"
+    ? `${label} · installed runtime version unavailable.`
+    : `${label} · installed runtime version ${version}.`;
 }
 
 function sessionModel(status, ownerId, targetId, endpoint) {
@@ -1318,11 +1509,21 @@ async function loadOnce() {
     state.csrf = session.csrf_token || null;
     byId("session-note").textContent = state.actor ? `Signed in as ${state.actor}` : "Signed-in operator";
     const [profileList, status] = await Promise.all([api("/api/v1/profiles"), api("/api/v1/status")]);
-    (Array.isArray(profileList) ? profileList : PROFILE_FALLBACK.map(([id, display_name, adapter]) => ({ id, display_name, adapter }))).forEach((profile) => {
-      const id = profile.id || profile.profile_id;
-      if (id) state.profiles.set(id, { ...profile, id });
+    if (Array.isArray(profileList)) {
+      const confirmed = new Set();
+      profileList.forEach((profile) => {
+        const id = profile?.id || profile?.profile_id;
+        if (!id) return;
+        state.profiles.set(id, { ...profile, id });
+        confirmed.add(String(id));
+      });
+      // A non-empty list that yields no usable id is malformed; keep the last
+      // confirmed set rather than declaring every server unconfigured.
+      if (confirmed.size || !profileList.length) state.configuredProfiles = confirmed;
+    }
+    PROFILE_FALLBACK.forEach(([id, display_name]) => {
+      if (!state.profiles.has(id)) state.profiles.set(id, { id, display_name, unconfigured: true });
     });
-    PROFILE_FALLBACK.forEach(([id, display_name]) => { if (!state.profiles.has(id)) state.profiles.set(id, { id, display_name }); });
     populateNotificationProfiles();
     renderCards();
     applyStatus(status, { confirmed: true });
@@ -1343,10 +1544,11 @@ async function loadOnce() {
     const message = error.message || "Status unavailable.";
     if (message !== loadFailureNotice) { notify(message); loadFailureNotice = message; }
     // Keep the last confirmed view intact during a gateway outage. The
-    // fallback is only useful on an initial load with no known profiles.
+    // fallback is only useful on an initial load with no known profiles, and it
+    // stays control-free: state.configuredProfiles is deliberately not cleared.
     if (!state.profiles.size) {
       PROFILE_FALLBACK.forEach(([id, display_name, adapter]) => {
-        state.profiles.set(id, { id, display_name, adapter });
+        state.profiles.set(id, { id, display_name, adapter, unconfigured: true });
         state.statuses.set(id, { profile_id: id, state: "unknown", health: "unknown" });
       });
       renderCards();
@@ -1370,6 +1572,9 @@ function populateNotificationProfiles() {
   const prior = select.value;
   select.replaceChildren();
   state.profiles.forEach((profile, id) => {
+    // Alerts are a controller mutation; an unconfigured placeholder has no
+    // controller profile to configure them for.
+    if (!profileIsConfigured(id)) return;
     const option = document.createElement("option"); option.value = id; option.textContent = profile.display_name || id; select.append(option);
   });
   select.value = [...select.options].some((option) => option.value === prior) ? prior : select.options[0]?.value || "";
@@ -1463,6 +1668,13 @@ const INCIDENT_COPY = {
   internal_error: ["Controller error", "Horizon rejected the operation without exposing internal details."],
 };
 const CRITICAL_INCIDENTS = new Set(["start_timeout", "health_failed", "backup_failed", "restore_failed", "update_failed", "internal_error"]);
+// A bounded slice of the controller's audit page. Occurrence detail is
+// supporting context for the derived status, not a second incident list.
+const INCIDENT_OCCURRENCE_LIMIT = 200;
+
+function incidentProfileLabel(profileId) {
+  return profileId ? profileLabel(profileId) : "Horizon (no profile)";
+}
 
 function deriveIncidents(auditItems) {
   const items = (Array.isArray(auditItems) ? auditItems : [])
@@ -1480,18 +1692,43 @@ function deriveIncidents(auditItems) {
       firstSeen: item.timestamp,
       lastSeen: item.timestamp,
       occurrences: 0,
+      occurrenceTimes: [],
       resolvedAt: null,
+      resolvedAction: null,
     };
     existing.lastSeen = item.timestamp;
     existing.occurrences += 1;
+    if (existing.occurrenceTimes.length < INCIDENT_OCCURRENCE_LIMIT) existing.occurrenceTimes.push(item.timestamp);
     existing.resolvedAt = null;
+    existing.resolvedAction = null;
     groups.set(key, existing);
   });
   groups.forEach((incident) => {
+    // The only recovery signal Horizon has is a later success for the same
+    // operation on the same profile. Nothing here inspects arguments or logs,
+    // and no separate "cleared" backend event is invented.
     const resolved = items.find((item) => item.result === "succeeded" && item.action === incident.action && (item.profile_id || null) === incident.profileId && new Date(item.timestamp) > new Date(incident.lastSeen));
-    if (resolved) incident.resolvedAt = resolved.timestamp;
+    if (resolved) { incident.resolvedAt = resolved.timestamp; incident.resolvedAction = resolved.action; }
   });
   return [...groups.values()].sort((left, right) => new Date(right.lastSeen) - new Date(left.lastSeen));
+}
+
+function incidentDerivationCopy(incident) {
+  const operation = titleCase(incident.action);
+  const profile = incidentProfileLabel(incident.profileId);
+  const occurrences = incident.occurrenceTimes.map((time) => new Date(time).toLocaleString());
+  const occurrenceText = occurrences.length
+    ? `Occurrences in this window (${incident.occurrences}): ${occurrences.join("; ")}`
+    : `Occurrences in this window: ${incident.occurrences}`;
+  const evidence = "The badge uses a later same-operation success as evidence, not proof that every symptom is fixed.";
+  const status = incident.resolvedAt
+    ? `Resolved is derived from Horizon's typed audit record: a later ${incident.resolvedAction || incident.action} succeeded for ${profile} on ${new Date(incident.resolvedAt).toLocaleString()}.`
+    : `Needs review is derived from Horizon's typed audit record: no later successful ${operation.toLowerCase()} for ${profile} appears in the latest 200 entries.`;
+  return [
+    status,
+    evidence,
+    occurrenceText,
+  ];
 }
 
 function renderIncidentRail(listId, incidents, { limit = 50, summaryId } = {}) {
@@ -1513,11 +1750,18 @@ function renderIncidentRail(listId, incidents, { limit = 50, summaryId } = {}) {
     const stateLabel = document.createElement("span"); stateLabel.className = "incident-state"; stateLabel.textContent = active ? "Needs review" : "Resolved";
     top.append(heading, stateLabel);
     const meta = document.createElement("p"); meta.className = "incident-meta";
-    const profile = incident.profileId ? profileLabel(incident.profileId) : "Horizon";
+    const profile = incidentProfileLabel(incident.profileId);
     const count = incident.occurrences > 1 ? ` · ${incident.occurrences} occurrences` : "";
     meta.textContent = `${profile} · ${new Date(incident.lastSeen).toLocaleString()}${count}`;
     const copy = document.createElement("p"); copy.className = "incident-copy"; copy.textContent = hint;
-    body.append(top, meta, copy); row.append(marker, body); list.append(row);
+    const details = document.createElement("details");
+    details.className = "incident-detail";
+    const summary = document.createElement("summary"); summary.textContent = active ? "Why this needs review" : "What resolved it";
+    const breakdown = document.createElement("div"); breakdown.className = "incident-breakdown";
+    const derivation = incidentDerivationCopy(incident);
+    breakdown.append(...derivation.map((line) => { const node = document.createElement("p"); node.textContent = line; return node; }));
+    details.append(summary, breakdown);
+    body.append(top, meta, copy, details); row.append(marker, body); list.append(row);
   });
   if (!visible.length) {
     const empty = document.createElement("li"); empty.className = "incident-empty is-clear"; empty.textContent = "No recent controller failures. Horizon's typed record is clear."; list.append(empty);
@@ -1738,7 +1982,7 @@ function populateTargets(preferredTarget = null) {
   const prior = preferredTarget || target.value;
   target.replaceChildren();
   state.profiles.forEach((profile, id) => {
-    if (id === current) return;
+    if (id === current || !profileIsConfigured(id)) return;
     const option = document.createElement("option");
     option.value = id;
     option.textContent = profile.display_name || id;
@@ -1748,6 +1992,61 @@ function populateTargets(preferredTarget = null) {
   byId("switch-current").textContent = current ? profileLabel(current) : "No active server";
   byId("switch-target-summary").textContent = target.selectedOptions[0]?.textContent || "Choose a target";
   byId("switch-timeout").textContent = "Up to 5 minutes";
+  renderSwitchBackup();
+  renderSwitchConsequence();
+}
+
+function runningProfile() {
+  return slotOwnerId() || [...state.statuses.values()].find((item) => item.state === "running")?.profile_id || null;
+}
+
+// The switch dialog's backup row names its owner: the profile that owns the
+// active slot. It is loaded on open, bounded to the latest entry, and guarded
+// against a stale response for a profile that is no longer the running one.
+async function loadSwitchBackup(profileId) {
+  state.switchBackup = { profileId: profileId || null, status: profileId ? "loading" : "idle", latest: null };
+  renderSwitchBackup();
+  if (!profileId) return;
+  try {
+    const page = await api(`/api/v1/profiles/${encodeURIComponent(profileId)}/backups?limit=1`);
+    if (state.switchBackup?.profileId !== profileId) return;
+    state.switchBackup = { profileId, status: "ready", latest: (Array.isArray(page.items) ? page.items[0] : null) || null };
+  } catch {
+    if (state.switchBackup?.profileId !== profileId) return;
+    state.switchBackup = { profileId, status: "unavailable", latest: null };
+  }
+  renderSwitchBackup();
+}
+
+function renderSwitchBackup() {
+  const node = byId("switch-backup");
+  const owner = byId("switch-backup-owner");
+  const current = runningProfile();
+  if (!current) {
+    if (owner) owner.textContent = "Last backup";
+    node.textContent = "No source backup needed — no server is running";
+    return;
+  }
+  if (owner) owner.textContent = `Last backup (${profileLabel(current)})`;
+  const info = state.switchBackup;
+  if (!info || info.profileId !== current) { node.textContent = `Checking ${profileLabel(current)} backups…`; return; }
+  if (info.status === "unavailable") { node.textContent = "Unavailable — backup list could not be read"; return; }
+  if (info.status !== "ready") { node.textContent = `Checking ${profileLabel(current)} backups…`; return; }
+  node.textContent = info.latest?.created_at ? new Date(info.latest.created_at).toLocaleString() : `None recorded for ${profileLabel(current)}`;
+}
+
+// The selected target row and this hint both name the running profile and the
+// chosen target, and state what actually happens when nothing is running.
+function renderSwitchConsequence() {
+  const node = byId("switch-consequence");
+  if (!node) return;
+  const current = runningProfile();
+  const target = byId("switch-target").selectedOptions[0]?.textContent || "the selected target";
+  if (!current) {
+    node.textContent = `No server is running, so confirming just sends a start request for ${target}. Nothing is stopped, no backup is taken and no switch is performed; each profile keeps its own world data.`;
+    return;
+  }
+  node.textContent = `Switching stops ${profileLabel(current)}, then starts ${target}. A fresh backup is created only when that option is checked and it belongs to ${profileLabel(current)}; each profile keeps its own world data.`;
 }
 
 function openSwitchDialog(targetId, opener) {
@@ -1759,6 +2058,7 @@ function openSwitchDialog(targetId, opener) {
   const updating = updateOwner();
   byId("switch-target-summary").textContent = updating ? updateNotice(profileLabel(updating)) : expected || "Choose a target";
   byId("switch-confirm").disabled = true;
+  loadSwitchBackup(runningProfile());
 }
 
 async function mutate(id, operation) {
@@ -1899,6 +2199,7 @@ function setupSessionDeck() {
 
 function setupDialog(dialog, opener) {
   state.dialog = dialog;
+  state.dialogGeneration += 1;
   state.returnFocus = opener || document.activeElement;
   dialog.showModal();
   const focusable = dialog.querySelectorAll("button, input, select, textarea, [tabindex]:not([tabindex='-1'])");
@@ -1911,6 +2212,26 @@ function closeDialog(dialog) {
   state.dialog = null;
   state.returnFocus = null;
   if (focus && document.contains(focus)) focus.focus();
+}
+
+// A close/Cancel control must never depend on form validity, typed text or the
+// state of the action button, so every dialog close control is an explicit
+// `type="button"` that closes its dialog here instead of submitting the form.
+function closeControlFor(target) {
+  return target instanceof Element ? target.closest("[data-dialog-close]") : null;
+}
+
+// Submit intent must come from the dialog's action button itself. A submit with
+// no submitter, a different control, a disabled control or a scripted
+// submission is treated as a dismissal and never reaches a lifecycle or export
+// action.
+function actionSubmitter(event, dialog, actionButton) {
+  const submitter = event.submitter;
+  if (!submitter || submitter !== actionButton || submitter.disabled || submitter.value !== "default") {
+    if (submitter) closeDialog(dialog);
+    return null;
+  }
+  return submitter;
 }
 
 document.addEventListener("keydown", (event) => {
@@ -1942,17 +2263,30 @@ function wireDialogForms() {
     switchButton.disabled = !expected || switchText.value.trim().toLowerCase() !== expected.trim().toLowerCase();
   };
   byId("switch-active").addEventListener("click", (event) => openSwitchDialog(null, event.currentTarget));
-  switchTarget.addEventListener("change", validateSwitch);
+  switchTarget.addEventListener("change", () => { validateSwitch(); renderSwitchConsequence(); });
   switchText.addEventListener("input", validateSwitch);
   byId("switch-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (event.submitter?.value === "cancel") { closeDialog(switchDialog); return; }
+    if (!actionSubmitter(event, switchDialog, switchButton)) return;
     if (updateOwner()) { notify(updateNotice()); return; }
-    if (switchButton.disabled) return;
+    const expected = switchTarget.selectedOptions[0]?.textContent || "";
+    if (switchButton.disabled || !expected || switchText.value.trim().toLowerCase() !== expected.trim().toLowerCase()) {
+      notify(`Type ${expected || "the target server"} exactly to confirm the switch.`);
+      return;
+    }
     const current = slotOwnerId() || [...state.statuses.values()].find((item) => item.state === "running")?.profile_id;
     const target = switchTarget.value;
+    const generation = state.dialogGeneration;
+    if (!current) {
+      // No profile owns the active slot: there is nothing to stop or switch, so
+      // the confirmed intent is a plain start of the chosen target.
+      closeDialog(switchDialog);
+      await mutate(target, "start");
+      return;
+    }
     try {
       const confirmation = await api("/api/v1/switch/prepare", { method: "POST", body: JSON.stringify({ current_profile_id: current, target_profile_id: target, create_backup: byId("switch-backup-option").checked, force_after_timeout: byId("switch-force-option").checked, rollback_on_failure: byId("switch-rollback-option").checked }) });
+      if (!switchDialog.open || state.dialogGeneration !== generation) return;
       await api("/api/v1/switch/confirm", { method: "POST", body: JSON.stringify({ confirmation_id: confirmation.confirmation_id }) });
       closeDialog(switchDialog); notify(`Switch to ${profileLabel(target)} requested.`);
     } catch (error) { notify(error.message || "Switch was not accepted."); }
@@ -1967,14 +2301,28 @@ function wireDialogForms() {
       if (focus && document.contains(focus)) focus.focus();
     });
   });
+  document.addEventListener("click", (event) => {
+    const control = closeControlFor(event.target);
+    if (!control) return;
+    const dialog = control.closest("dialog");
+    if (dialog && state.dialog === dialog) closeDialog(dialog);
+  });
 
   const forceDialog = byId("force-dialog");
   byId("force-confirm-text").addEventListener("input", () => { byId("force-confirm").disabled = byId("force-confirm-text").value.trim().toLowerCase() !== profileLabel(state.forceProfile).toLowerCase(); });
   byId("force-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!actionSubmitter(event, forceDialog, byId("force-confirm"))) return;
     const id = state.forceProfile;
+    const expected = profileLabel(id);
+    if (byId("force-confirm").disabled || byId("force-confirm-text").value.trim().toLowerCase() !== expected.trim().toLowerCase()) {
+      notify(`Type ${expected} exactly to confirm the force stop.`);
+      return;
+    }
+    const generation = state.dialogGeneration;
     try {
       const confirmation = await api(`/api/v1/profiles/${encodeURIComponent(id)}/force-stop/prepare`, { method: "POST", body: JSON.stringify({}) });
+      if (!forceDialog.open || state.dialogGeneration !== generation) return;
       await api("/api/v1/force-stop/confirm", { method: "POST", body: JSON.stringify({ confirmation_id: confirmation.confirmation_id }) });
       closeDialog(forceDialog); notify(`Force stop requested for ${profileLabel(id)}.`);
     } catch (error) { notify(error.message || "Force stop was not accepted."); }
@@ -1988,10 +2336,18 @@ function wireDialogForms() {
   byId("restore-backup-id").addEventListener("input", () => { byId("restore-confirm-text").dispatchEvent(new Event("input")); });
   byId("restore-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (event.submitter?.value === "cancel") { closeDialog(byId("restore-dialog")); return; }
+    if (!actionSubmitter(event, byId("restore-dialog"), byId("restore-confirm"))) return;
     const id = state.restoreProfile;
+    const expected = profileLabel(id);
+    const backupId = byId("restore-backup-id").value.trim();
+    if (byId("restore-confirm").disabled || !backupId || byId("restore-confirm-text").value.trim().toLowerCase() !== expected.trim().toLowerCase()) {
+      notify(`Choose a backup and type ${expected} exactly to confirm the restore.`);
+      return;
+    }
+    const generation = state.dialogGeneration;
     try {
-      const confirmation = await api(`/api/v1/profiles/${encodeURIComponent(id)}/restore/prepare`, { method: "POST", body: JSON.stringify({ backup_id: byId("restore-backup-id").value.trim() }) });
+      const confirmation = await api(`/api/v1/profiles/${encodeURIComponent(id)}/restore/prepare`, { method: "POST", body: JSON.stringify({ backup_id: backupId }) });
+      if (!byId("restore-dialog").open || state.dialogGeneration !== generation) return;
       await api("/api/v1/restore/confirm", { method: "POST", body: JSON.stringify({ confirmation_id: confirmation.confirmation_id }) });
       closeDialog(byId("restore-dialog")); notify(`Restore requested for ${profileLabel(id)}.`);
     } catch (error) { notify(error.message || "Restore was not accepted."); }
@@ -1999,15 +2355,17 @@ function wireDialogForms() {
 
   byId("update-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (event.submitter?.value === "cancel") { closeDialog(byId("update-dialog")); return; }
+    if (!actionSubmitter(event, byId("update-dialog"), byId("update-confirm"))) return;
     if (!state.updateApplySupported) return;
     const id = state.updateProfile;
     if (!id) return;
     const confirm = byId("update-confirm");
     confirm.disabled = true;
     confirm.textContent = "Applying…";
+    const generation = state.dialogGeneration;
     try {
       const prepared = await api(`/api/v1/profiles/${encodeURIComponent(id)}/update/prepare`, { method: "POST", body: "{}" });
+      if (!byId("update-dialog").open || state.dialogGeneration !== generation) return;
       await api("/api/v1/update/confirm", { method: "POST", body: JSON.stringify({ confirmation_id: prepared.confirmation_id }) });
       closeDialog(byId("update-dialog"));
       notify(`Update requested for ${profileLabel(id)}.`);
@@ -2036,7 +2394,8 @@ function openRestore(id, opener, backupId = "") {
     return;
   }
   state.restoreProfile = id;
-  byId("restore-description").textContent = `Restoring replaces ${profileLabel(id)} world data.`;
+  const stamped = record?.created_at ? ` (${new Date(record.created_at).toLocaleString()})` : "";
+  byId("restore-description").textContent = `Restoring replaces ${profileLabel(id)} world data with backup ${backupId || "—"}${stamped}. The server must be stopped first: Horizon refuses a restore while it is running and does not stop it for you. Horizon creates a protected backup of the current world under this profile before replacing anything, so the state being replaced stays recoverable; changes made after the chosen backup are not in the restored world, and you start the server again yourself once the restore finishes.`;
   byId("restore-backup-id").value = backupId;
   byId("restore-confirm-text").value = "";
   byId("restore-confirm").disabled = !backupId;
@@ -2083,10 +2442,10 @@ function routeFromHash() {
   if (hash === "/backups" || hash === "backups") return { view: "backups" };
   if (hash === "/events" || hash === "events") return { view: "events" };
   if (hash === "/audit" || hash === "audit") return { view: "audit" };
-  const match = hash.match(/^\/servers\/([^/]+)(?:\/([^/]+))?$/) || hash.match(/^server\/([^/]+)(?:\/([^/]+))?$/);
+  const match = hash.match(/^\/servers\/([^/]+)(?:\/([^/]+))?(?:\/([^/]+))?$/) || hash.match(/^server\/([^/]+)(?:\/([^/]+))?(?:\/([^/]+))?$/);
   if (match) {
     try {
-      return { view: "detail", id: decodeURIComponent(match[1]), tab: match[2] || "console" };
+      return { view: "detail", id: decodeURIComponent(match[1]), tab: match[2] || "console", section: match[3] || null };
     } catch {
       return { view: "dashboard" };
     }
@@ -2259,7 +2618,52 @@ function patchCapacityTrack(id, value, maximum) {
 const STATS_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod", "pz-rising"]);
 const TICK_PROFILES = new Set(["minecraft", "minecraft-sunlit-cobblemon"]);
 const STATS_WINDOWS = { "1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720 };
+const STATS_WINDOW_LABELS = { "1h": "last 1 hour", "6h": "last 6 hours", "24h": "last 24 hours", "7d": "last 7 days", "30d": "last 30 days" };
 const HEATMAP_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const RECORDER_PAGE_SIZES = [50, 100, 200];
+const recorderTable = { key: null, page: 1 };
+
+// The window select is the single source of truth for every player/telemetry
+// period label, so the copy always names the period the queries actually used.
+// A base (summary + heatmap) is only usable for the window it was requested
+// with; otherwise its numbers would be painted under another window's labels.
+function statsBaseReady() {
+  return Boolean(state.detail.statsBaseLoaded && state.detail.statsBaseWindow === statsWindowKey());
+}
+
+// Single accessor for cached recorder payloads: a cache entry is only reusable
+// for the window it was requested with, so resize/comparison re-renders cannot
+// re-domain an older window's samples under the current labels.
+function cachedStatsTps(id) {
+  const cached = state.statsCache.get(id);
+  return cached?.tps && cached.tpsWindow === statsWindowKey() ? cached.tps : null;
+}
+
+// State the window mismatch explicitly instead of letting period labels drift
+// onto data that came from a different window.
+function patchStatsBaseNotice(message) {
+  const note = byId("stats-period-note");
+  if (!note) return;
+  const shown = state.detail.statsShownWindow;
+  const selected = statsWindowKey();
+  const suffix = message ? ` (${message})` : "";
+  if (shown && shown !== selected) {
+    note.textContent = message
+      ? `Showing the ${STATS_WINDOW_LABELS[shown]} player summary because the ${statsWindowPhrase()} request failed${suffix}. It retries automatically.`
+      : `Loading the ${statsWindowPhrase()} player summary; showing the ${STATS_WINDOW_LABELS[shown]} data until it arrives.`;
+    return;
+  }
+  note.textContent = `The ${statsWindowPhrase()} player summary is unavailable right now${suffix}. It retries automatically.`;
+}
+
+function statsWindowKey() {
+  const key = byId("stats-window")?.value;
+  return Object.prototype.hasOwnProperty.call(STATS_WINDOW_LABELS, key) ? key : "6h";
+}
+
+function statsWindowPhrase() {
+  return STATS_WINDOW_LABELS[statsWindowKey()];
+}
 
 function clearStatsTimer() {
   if (state.detail.statsTimer) window.clearInterval(state.detail.statsTimer);
@@ -2270,6 +2674,9 @@ function clearStatsTimer() {
 
 function renderStatsSummary(summary) {
   const countOnly = summary?.player_tracking === "count";
+  state.detail.statsTracking = summary?.player_tracking === "count" ? "count" : summary?.player_tracking ? "names" : state.detail.statsTracking;
+  state.detail.statsShownWindow = statsWindowKey();
+  state.detail.statsShownProfile = state.detail.id;
   byId("stats-summary").hidden = countOnly;
   byId("stats-leaderboard").closest(".stats-block").hidden = countOnly;
   byId("stats-heatmap").closest(".stats-block").hidden = countOnly;
@@ -2278,22 +2685,47 @@ function renderStatsSummary(summary) {
   const unique = Number(summary?.unique_players);
   byId("stats-total-hours").textContent = Number.isFinite(total) ? total.toFixed(2) : "—";
   byId("stats-unique-players").textContent = Number.isFinite(unique) ? String(unique) : "—";
-  byId("stats-leaderboard-meta").textContent = Number.isFinite(unique) ? `${unique} player${unique === 1 ? "" : "s"}` : "—";
+  byId("stats-leaderboard-meta").textContent = Number.isFinite(unique)
+    ? `${unique} player${unique === 1 ? "" : "s"} · ${statsWindowPhrase()}` : "—";
   const latest = Number(summary?.occupancy?.latest);
   byId("stats-occupancy-current").textContent = Number.isFinite(latest) ? `${latest} online` : "Unavailable";
+  patchStatsPeriodLabels();
+  applyStatsSectionFocus();
+}
+
+// Name the selected period next to the player totals and empty states; a six
+// hour window with no sessions is not evidence of all-time history.
+function patchStatsPeriodLabels() {
+  const phrase = statsWindowPhrase();
+  const note = byId("stats-period-note");
+  if (note) note.textContent = `Player totals, the leaderboard, and the heatmap cover the selected window (${phrase}). Widen the Window control to look further back.`;
+  byId("stats-total-hours-period").textContent = `(${phrase})`;
+  byId("stats-unique-players-period").textContent = `(${phrase})`;
+}
+
+function renderStatsLeaderboardEmpty(body, filterPeriod) {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.className = "empty-state";
+  cell.colSpan = 4;
+  cell.textContent = `No sessions recorded in the ${filterPeriod}. This is not all-time history; widen the Window control to search further back.`;
+  row.append(cell);
+  body.append(row);
+}
+
+// An empty state must not inherit the table's fixed min-width, which pushes the
+// centered sentence off a phone-width viewport.
+function markStatsTable(body, isEmpty) {
+  const table = body.closest("table");
+  if (table) table.classList.toggle("is-empty", Boolean(isEmpty));
 }
 
 function renderStatsLeaderboard(rows) {
   const body = byId("stats-leaderboard");
   body.replaceChildren();
   if (!Array.isArray(rows) || !rows.length) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.className = "empty-state";
-    cell.colSpan = 4;
-    cell.textContent = "No sessions recorded yet.";
-    row.append(cell);
-    body.append(row);
+    renderStatsLeaderboardEmpty(body, statsWindowPhrase());
+    markStatsTable(body, true);
     return;
   }
   rows.forEach((item) => {
@@ -2307,11 +2739,18 @@ function renderStatsLeaderboard(rows) {
     row.append(player, hours, sessions, lastSeen);
     body.append(row);
   });
+  markStatsTable(body, false);
 }
 
 function renderStatsHeatmap(result) {
   const grid = byId("stats-heatmap");
   grid.replaceChildren();
+  const meta = byId("stats-heatmap-meta");
+  if (meta) {
+    const asOf = result?.as_of ? new Date(result.as_of) : null;
+    const stamp = asOf && !Number.isNaN(asOf.valueOf()) ? ` (as of ${asOf.toLocaleString()})` : "";
+    meta.textContent = `UTC · ${statsWindowPhrase()}${stamp}`;
+  }
   const buckets = Array.isArray(result?.buckets) ? result.buckets : [];
   const values = buckets.flatMap((row) => Array.isArray(row) ? row.map(Number) : []).filter(Number.isFinite);
   const maximum = Math.max(0, ...values);
@@ -2497,13 +2936,63 @@ function drawFlightRecorder(result, samples) {
   queueClientPerformance("recorder_draw", (window.performance?.now?.() || drawStarted) - drawStarted);
 }
 
+function recorderFilterKey() {
+  return ["available", "inactive", "unavailable"].includes(byId("recorder-filter")?.value) ? byId("recorder-filter").value : "all";
+}
+
+function recorderPageSize() {
+  const size = Number(byId("recorder-page-size")?.value);
+  return RECORDER_PAGE_SIZES.includes(size) ? size : RECORDER_PAGE_SIZES[0];
+}
+
+// Reset paging only when the profile or window selection changes; a periodic
+// poll that appends samples must not move a reader off the page they are on.
+function recorderTableKey() {
+  return `${state.detail.id || ""}:${statsWindowKey()}:${byId("stats-resolution")?.value || "auto"}`;
+}
+
+function recorderCoverageText(items, domain, pageSize, filteredCount, filter) {
+  const fmt = (time) => new Date(time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const coverage = `${fmt(domain.start)} → ${fmt(domain.end)} (local time)`;
+  if (!items.length) return `No telemetry samples are recorded in the selected window (${statsWindowPhrase()}). Chart coverage: ${coverage}.`;
+  const counts = { available: 0, inactive: 0, unavailable: 0 };
+  items.forEach((item) => { counts[item.state] = (counts[item.state] || 0) + 1; });
+  // The chart always plots every sample; the table below may be filtered, so
+  // state which count each one shows instead of claiming they hold the same rows.
+  const table = filter === "all"
+    ? `The chart plots ${items.length} samples in the selected window (${statsWindowPhrase()}), and the table below pages all of them newest first, in rows of ${pageSize}.`
+    : `The chart plots ${items.length} samples in the selected window (${statsWindowPhrase()}); the table below is filtered to ${filteredCount} ${filter} sample${filteredCount === 1 ? "" : "s"}, paged in rows of ${pageSize}.`;
+  return `${table} Coverage ${coverage}. `
+    + `${counts.available} active, ${counts.inactive} inactive, ${counts.unavailable} unavailable.`;
+}
+
+function renderRecorderEmptyRow(body, message) {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 5; cell.className = "empty-state"; cell.textContent = message;
+  row.append(cell); body.append(row);
+}
+
 function renderRecorderTable(result, samples) {
   const body = byId("stats-recorder-table");
+  if (!body) return;
   body.replaceChildren();
+  const domain = recorderDomain(samples);
+  const inWindow = samples.filter((item) => item.time >= domain.start && item.time <= domain.end);
+  const ordered = [...inWindow].reverse();
+  const filter = recorderFilterKey();
+  const filtered = filter === "all" ? ordered : ordered.filter((item) => item.state === filter);
+  const pageSize = recorderPageSize();
+  const key = recorderTableKey();
+  if (recorderTable.key !== key) { recorderTable.key = key; recorderTable.page = 1; }
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  recorderTable.page = Math.min(Math.max(1, recorderTable.page), pageCount);
+  const start = (recorderTable.page - 1) * pageSize;
+  const pageItems = filtered.slice(start, start + pageSize);
   const context = recorderContext(result);
   const causes = [...context.jobs.map((job) => ({ time: job.start, label: job.kind })),
     ...context.series.gc_pause.map((item) => ({ time: item.time, label: "GC pause" }))];
-  samples.slice(-120).forEach((sample) => {
+  pageItems.forEach((sample) => {
     const row = document.createElement("tr");
     const nearby = [...new Set(causes.filter((item) => Math.abs(item.time - sample.time) <= 60_000)
       .map((item) => item.label))];
@@ -2513,7 +3002,31 @@ function renderRecorderTable(result, samples) {
     });
     body.append(row);
   });
-  if (!body.children.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 5; cell.className = "empty-state"; cell.textContent = "No telemetry in this window."; row.append(cell); body.append(row); }
+  if (!pageItems.length) {
+    renderRecorderEmptyRow(body, inWindow.length
+      ? `No ${filter} samples in the selected window (${statsWindowPhrase()}). Choose “All samples” to see the other states.`
+      : `No telemetry samples are recorded in the selected window (${statsWindowPhrase()}).`);
+  }
+  markStatsTable(body, !filtered.length);
+  const coverage = byId("recorder-coverage");
+  if (coverage) coverage.textContent = recorderCoverageText(inWindow, domain, pageSize, filtered.length, filter);
+  const status = byId("recorder-page-status");
+  if (status) {
+    status.textContent = filtered.length
+      ? `Rows ${start + 1}–${Math.min(start + pageSize, filtered.length)} of ${filtered.length} · page ${recorderTable.page} of ${pageCount}`
+      : `No rows · page ${recorderTable.page} of ${pageCount}`;
+  }
+  const previous = byId("recorder-prev"); const next = byId("recorder-next");
+  if (previous) previous.disabled = recorderTable.page <= 1 || !filtered.length;
+  if (next) next.disabled = recorderTable.page >= pageCount || !filtered.length;
+}
+
+function rerenderRecorderTable() {
+  const cached = state.statsCache.get(state.detail.id);
+  // Filter and pager controls re-render the recorded payload, never a payload
+  // captured under a different window selection.
+  if (!cached?.tps || cached.tpsWindow !== statsWindowKey()) return;
+  renderRecorderTable(cached.tps, recorderSamples(cached.tps));
 }
 
 function renderComparisonOptions(result) {
@@ -2559,14 +3072,45 @@ function renderStatsTpsUnavailable(message, { preserve = false } = {}) {
 }
 
 function renderStatsUnavailable(message) {
+  // Nothing attributable to this profile on screen: paint the neutral loading
+  // panel so another profile's numbers or layout cannot survive the failure.
+  if (state.detail.statsShownProfile !== state.detail.id) resetStatsPanel();
+  // Preserve the layout the shown summary established (count-only games keep
+  // occupancy) instead of switching to the named-player layout on failure.
+  const countOnly = state.detail.statsTracking === "count";
+  byId("stats-summary").hidden = countOnly;
+  byId("stats-leaderboard").closest(".stats-block").hidden = countOnly;
+  byId("stats-heatmap").closest(".stats-block").hidden = countOnly;
+  byId("stats-occupancy-block").hidden = !countOnly;
+  if (!state.detail.statsTracking) state.detail.statsTracking = "names";
+  renderStatsTpsUnavailable(message, { preserve: Boolean(state.statsCache.get(state.detail.id)?.tps) });
+  patchStatsBaseNotice(message);
+  applyStatsSectionFocus();
+}
+
+// Neutral, explicitly-unknown player panel for a profile whose data is not
+// shown yet; never reuses another profile's values, labels, or layout.
+function resetStatsPanel() {
+  state.detail.statsShownWindow = null;
+  state.detail.statsShownProfile = state.detail.id;
+  state.detail.statsTracking = null;
+  byId("stats-total-hours").textContent = "—";
+  byId("stats-unique-players").textContent = "—";
+  byId("stats-leaderboard-meta").textContent = "—";
+  byId("stats-occupancy-current").textContent = "—";
   byId("stats-summary").hidden = false;
   byId("stats-leaderboard").closest(".stats-block").hidden = false;
   byId("stats-heatmap").closest(".stats-block").hidden = false;
   byId("stats-occupancy-block").hidden = true;
-  if (!state.statsCache.get(state.detail.id)?.base) {
-    renderStatsSummary({}); renderStatsLeaderboard([]); renderStatsHeatmap({ buckets: [] });
-  }
-  renderStatsTpsUnavailable(message, { preserve: Boolean(state.statsCache.get(state.detail.id)?.tps) });
+  patchStatsPeriodLabels();
+  const body = byId("stats-leaderboard");
+  body.replaceChildren();
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 4; cell.className = "empty-state"; cell.textContent = "Loading player history…";
+  row.append(cell); body.append(row);
+  markStatsTable(body, true);
+  renderStatsHeatmap({ buckets: [] });
 }
 
 function renderStatsTps(result) {
@@ -2580,6 +3124,20 @@ function renderStatsTps(result) {
   byId("stats-runtime-current").textContent = Number.isFinite(active) && Number.isFinite(wall) ? `${Math.round(active / 60)}m / ${Math.round(wall / 3600)}h` : "—";
   const effective = result?.resolution || "raw"; byId("stats-effective-resolution").textContent = `${effective} · ${samples.length}/${result?.limit || 720}`;
   const observedAt = latest?.time ? new Date(latest.time).toLocaleString() : null;
+  // The live strip can show the newest retained observation while the selected
+  // chart window contains no active sample. Say so next to the TPS/MSPT values.
+  const domain = recorderDomain(samples);
+  const outsideWindow = Boolean(latest && Number.isFinite(latest.time) && (latest.time < domain.start || latest.time > domain.end));
+  ["stats-tps-cell", "stats-mspt-cell"].forEach((cellId) => {
+    const cell = byId(cellId); if (cell) cell.dataset.outside = outsideWindow ? "true" : "false";
+  });
+  const lastObserved = byId("stats-last-observed");
+  if (lastObserved) {
+    lastObserved.hidden = !outsideWindow;
+    lastObserved.textContent = outsideWindow
+      ? `TPS and MSPT are the last observed values (${observedAt}), outside the selected window (${statsWindowPhrase()}). No active sample falls inside the chart window.`
+      : "";
+  }
   byId("stats-tps-note").textContent = signal === "offline" ? (observedAt
     ? `The server is stopped. Last tick observation: ${observedAt}. Offline time is shaded, not plotted as zero.`
     : "The server is stopped. Offline time is shaded, not plotted as zero.")
@@ -2598,29 +3156,35 @@ async function loadStats(id, { includeBase = true } = {}) {
   const controller = new AbortController(); state.detail.statsAbort = controller;
   if (!STATS_PROFILES.has(id)) { renderStatsUnavailable("Player stats not available for this game."); return; }
   const base = `/api/v1/profiles/${encodeURIComponent(id)}/stats`;
-  const windowKey = byId("stats-window")?.value || "24h";
+  const windowKey = statsWindowKey();
   const resolution = byId("stats-resolution")?.value || "auto";
   try {
     const hours = STATS_WINDOWS[windowKey] || 24;
     const requests = [];
-    if (includeBase || !state.detail.statsBaseLoaded) {
+    const needBase = includeBase || !statsBaseReady();
+    if (needBase) {
       requests.push(api(`${base}/summary?hours=${hours}`, { signal: controller.signal }), api(`${base}/heatmap?hours=${hours}`, { signal: controller.signal }));
     }
     if (TICK_PROFILES.has(id)) requests.push(api(`${base}/tps?window=${encodeURIComponent(windowKey)}&resolution=${encodeURIComponent(resolution)}&limit=720`, { signal: controller.signal }));
     const results = await Promise.all(requests);
     if (request !== state.detail.statsRequest || state.detail.id !== id) return;
     let offset = 0;
-    if (includeBase || !state.detail.statsBaseLoaded) {
+    if (needBase) {
       const [summary, heatmap] = results;
       state.detail.statsBaseLoaded = true;
+      state.detail.statsBaseWindow = windowKey;
       renderStatsSummary(summary); renderStatsLeaderboard(summary.leaderboard); renderStatsHeatmap(heatmap);
-      const cached = state.statsCache.get(id) || {}; cached.base = { summary, heatmap }; state.statsCache.set(id, cached);
+      const cached = state.statsCache.get(id) || {};
+      cached.base = { windowKey, summary, heatmap };
+      state.statsCache.set(id, cached);
       offset = 2;
     }
     const tpsBlock = byId("stats-tps-title").closest(".stats-tps-block");
     tpsBlock.hidden = !TICK_PROFILES.has(id);
     if (TICK_PROFILES.has(id)) {
-      const cached = state.statsCache.get(id) || {}; cached.tps = results[offset]; state.statsCache.set(id, cached);
+      const cached = state.statsCache.get(id) || {};
+      cached.tps = results[offset]; cached.tpsWindow = windowKey;
+      state.statsCache.set(id, cached);
       renderStatsTps(results[offset]);
     }
     queueClientPerformance("stats_fetch", (window.performance?.now?.() || fetchStarted) - fetchStarted);
@@ -2636,10 +3200,17 @@ async function loadStats(id, { includeBase = true } = {}) {
 
 function startStatsRefresh(id) {
   clearStatsTimer();
-  const cached = state.statsCache.get(id);
-  state.detail.statsBaseLoaded = Boolean(cached?.base);
-  if (cached?.base) { renderStatsSummary(cached.base.summary); renderStatsLeaderboard(cached.base.summary?.leaderboard); renderStatsHeatmap(cached.base.heatmap); }
-  if (cached?.tps) renderStatsTps(cached.tps);
+  const cached = state.statsCache.get(id) || {};
+  const windowKey = statsWindowKey();
+  // Another profile's painted summary must not survive a profile change, even
+  // when the new profile has no cache entry for the selected window.
+  if (state.detail.statsShownProfile !== id) resetStatsPanel();
+  // Only reuse a cache entry requested for the currently selected window.
+  const base = cached.base?.windowKey === windowKey ? cached.base : null;
+  state.detail.statsBaseLoaded = Boolean(base);
+  state.detail.statsBaseWindow = base ? windowKey : null;
+  if (base) { renderStatsSummary(base.summary); renderStatsLeaderboard(base.summary?.leaderboard); renderStatsHeatmap(base.heatmap); }
+  if (cached.tps && cached.tpsWindow === windowKey) renderStatsTps(cached.tps);
   loadStats(id, { includeBase: true });
   // Recurring timer: live recorder refresh only; callback is visibility-gated.
   state.detail.statsTimer = window.setInterval(() => {
@@ -2863,6 +3434,26 @@ function renderCommandCatalog(id) {
   });
 }
 
+// "Player activity" deep-links to the stats tab with a section segment. Focus
+// and scroll land on the player summary (or occupancy for count-only games)
+// after the profile's first stats render, so an async load cannot drop it.
+function statsPlayerTarget() {
+  return state.detail.statsTracking === "count" ? byId("stats-occupancy-block") : byId("stats-summary");
+}
+
+function applyStatsSectionFocus() {
+  if (state.detail.tab !== "stats" || state.detail.focusSection !== "players") return;
+  // Wait for the first stats render: only then is it known whether the player
+  // section is the totals/leaderboard block or the count-only occupancy block.
+  if (!state.detail.statsTracking) return;
+  const target = statsPlayerTarget();
+  if (!target || target.hidden) return;
+  state.detail.focusSection = null;
+  if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+  target.scrollIntoView({ block: "start" });
+  try { target.focus({ preventScroll: true }); } catch { target.focus(); }
+}
+
 function setDetailTab(tab) {
   const allowed = ["console", "metrics", "stats", "logs", "backups", "benchmarks", "config"];
   const requested = allowed.includes(tab) ? tab : "console";
@@ -2871,7 +3462,8 @@ function setDetailTab(tab) {
   clearStatsTimer();
   clearBenchmarkTimer();
   state.detail.tab = next;
-  if (next !== "stats") state.detail.statsBaseLoaded = false;
+  if (next !== "stats") { state.detail.statsBaseLoaded = false; state.detail.statsBaseWindow = null; }
+  if (next !== "stats") state.detail.focusSection = null;
   document.querySelectorAll("[data-detail-tab]").forEach((button) => {
     const selected = button.dataset.detailTab === next;
     button.setAttribute("aria-selected", String(selected));
@@ -2886,6 +3478,7 @@ function setDetailTab(tab) {
     const tpsBlock = byId("stats-tps-title")?.closest(".stats-tps-block");
     if (tpsBlock) tpsBlock.hidden = !TICK_PROFILES.has(state.detail.id);
     startStatsRefresh(state.detail.id);
+    applyStatsSectionFocus();
   }
   startMetricRefresh(state.detail.id);
 }
@@ -2993,6 +3586,7 @@ function patchDetail(id) {
   // Only claim acceptance when the server is actually starting. A stopped
   // profile is Offline, and an in-progress update says so plainly.
   byId("rail-version-note").textContent = configRestart.length ? "Config changed · restart required" : status.restart_required ? "Update available · restart required" : ownUpdate ? "Updating…" : ["stopped", "failed", "blocked", "unknown"].includes(rawCurrent) ? "Offline" : status.required_ports_ready ? "Ready on required ports" : "Accepted; waiting for readiness";
+  renderUpdateCheckResult(id);
   const samples = state.metricSamples.get(id) || { cpu: [], memory: [], players: [] };
   const history = state.metricHistory.get(id);
   void loadMetricCapacity(id);
@@ -3146,12 +3740,138 @@ function renderScheduleProfiles() {
   const selected = select.value;
   select.replaceChildren();
   [...state.profiles.values()].forEach((profile) => {
+    if (!profileIsConfigured(profile.id)) return;
     const option = document.createElement("option");
     option.value = profile.id;
     option.textContent = profile.display_name || profileLabel(profile.id);
     select.append(option);
   });
   if (selected && [...select.options].some((option) => option.value === selected)) select.value = selected;
+}
+
+// The controller parses exactly five numeric cron fields (``*``, ``a``,
+// ``a-b`` and ``/step`` on each comma-separated part) and matches them in UTC.
+// ``cronWeekday`` mirrors Python's ``(weekday + 1) % 7``: 0 is Sunday, so the
+// value lines up with ``Date#getUTCDay``.
+const CRON_FIELD_LIMITS = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]];
+const SCHEDULE_OPERATIONS = ["backup", "switch", "benchmark"];
+
+function parseCronExpression(expression) {
+  const text = String(expression ?? "").trim();
+  if (!text) return null;
+  const fields = text.split(/\s+/);
+  if (fields.length !== 5) return null;
+  const parsed = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    const [minimum, maximum] = CRON_FIELD_LIMITS[index];
+    const values = new Set();
+    for (const part of fields[index].split(",")) {
+      const match = /^(\*|\d+|\d+-\d+)(?:\/(\d+))?$/.exec(part);
+      if (!match) return null;
+      const step = match[2] === undefined ? 1 : Number(match[2]);
+      if (!Number.isInteger(step) || step <= 0) return null;
+      let start;
+      let end;
+      if (match[1] === "*") { start = minimum; end = maximum; }
+      else if (match[1].includes("-")) { const [left, right] = match[1].split("-"); start = Number(left); end = Number(right); }
+      else { start = Number(match[1]); end = start; }
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < minimum || end > maximum || start > end) return null;
+      for (let value = start; value <= end; value += step) values.add(value);
+    }
+    parsed.push(values);
+  }
+  return parsed;
+}
+
+function cronNextFire(parsed, from = new Date()) {
+  if (!parsed) return null;
+  const [minutes, hours, days, months, weekdays] = parsed;
+  let candidate = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate(), from.getUTCHours(), from.getUTCMinutes()));
+  if (from.getUTCSeconds() || from.getUTCMilliseconds()) candidate = new Date(candidate.getTime() + 60000);
+  const limit = new Date(candidate.getTime() + 366 * 4 * 86400000);
+  const hourValues = [...hours].sort((left, right) => left - right);
+  const minuteValues = [...minutes].sort((left, right) => left - right);
+  const day = new Date(Date.UTC(candidate.getUTCFullYear(), candidate.getUTCMonth(), candidate.getUTCDate()));
+  while (day <= limit) {
+    if (months.has(day.getUTCMonth() + 1) && days.has(day.getUTCDate()) && weekdays.has(day.getUTCDay())) {
+      for (const hour of hourValues) {
+        for (const minute of minuteValues) {
+          const possible = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour, minute));
+          if (possible >= candidate && possible <= limit) return possible;
+        }
+      }
+    }
+    day.setUTCDate(day.getUTCDate() + 1);
+  }
+  return null;
+}
+
+function scheduleTimezoneName() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "your local timezone"; } catch { return "your local timezone"; }
+}
+
+function scheduleUtcLabel(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown UTC time";
+  const options = { timeZone: "UTC", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
+  if (date.getUTCFullYear() !== new Date().getUTCFullYear()) options.year = "numeric";
+  return `${date.toLocaleString(undefined, options)} UTC`;
+}
+
+function scheduleDraftState() {
+  const input = byId("schedule-cron");
+  const expression = input ? input.value.trim() : "";
+  const parsed = parseCronExpression(expression);
+  if (!expression) return { expression, parsed: null, next: null, message: "Cron is read in UTC. Enter five fields (minute hour day-of-month month day-of-week) to preview the next run before adding it." };
+  if (!parsed) {
+    return {
+      expression,
+      parsed: null,
+      next: null,
+      // This preview only implements the plain numeric contract; it must not
+      // claim the controller rejects other spellings it may accept.
+      message: "Unsupported in this preview. Use plain numeric five-field cron such as 0 20 * * 5 with * , - and /steps; this form cannot check other spellings.",
+    };
+  }
+  const next = cronNextFire(parsed);
+  if (!next) {
+    return { expression, parsed, next: null, message: "No run matches this expression within the next four years, so this form cannot add it." };
+  }
+  return {
+    expression,
+    parsed,
+    next,
+    message: `Next run ${scheduleUtcLabel(next)} · ${next.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })} ${scheduleTimezoneName()}`,
+  };
+}
+
+function renderSchedulePreview() {
+  const preview = byId("schedule-preview");
+  const submit = byId("schedule-submit");
+  const draft = scheduleDraftState();
+  if (preview) preview.textContent = draft.message;
+  if (submit) submit.disabled = !draft.next;
+}
+
+function scheduleOperation(item) {
+  const explicit = typeof item?.operation === "string" ? item.operation : "";
+  // A forward-unknown operation must never be presented as a profile switch.
+  if (explicit) return ["backup", "switch", "benchmark"].includes(explicit) ? explicit : "unknown";
+  return item?.backup_destination ? "backup" : "switch";
+}
+
+function backupDestinationLabel(destination) {
+  if (destination === "local") return "Local disk";
+  if (destination === "horizon-b2") return "Horizon B2";
+  return String(destination);
+}
+
+function scheduleOperationLabel(item) {
+  const operation = scheduleOperation(item);
+  if (operation === "unknown") return "Unsupported operation";
+  if (operation === "backup") return item.backup_destination ? `Backup (${backupDestinationLabel(item.backup_destination)})` : "Backup";
+  if (operation === "benchmark") return item.campaign ? `Benchmark (${item.campaign})` : "Benchmark";
+  return "Profile switch";
 }
 
 function scheduleDateLabel(value, compact = false) {
@@ -3173,7 +3893,9 @@ function renderAutomationSummary(items) {
   const soonest = items
     .filter((item) => item?.enabled !== false && item.next_fire && !Number.isNaN(new Date(item.next_fire).getTime()))
     .sort((left, right) => new Date(left.next_fire) - new Date(right.next_fire))[0];
-  text.textContent = soonest ? `${profileLabel(soonest.profile)} · ${scheduleDateLabel(soonest.next_fire, true)}` : "None scheduled";
+  text.textContent = soonest
+    ? `${scheduleOperationLabel(soonest)} · ${profileLabel(soonest.profile)} · ${scheduleDateLabel(soonest.next_fire, true)}`
+    : "None scheduled";
 }
 
 function renderScheduleRows(items) {
@@ -3181,22 +3903,37 @@ function renderScheduleRows(items) {
   if (!list) return;
   list.replaceChildren();
   if (!items.length) {
-    const empty = document.createElement("p"); empty.className = "empty-state"; empty.textContent = "No scheduled switches."; list.append(empty); return;
+    const empty = document.createElement("p"); empty.className = "empty-state"; empty.textContent = "No scheduled automations."; list.append(empty); return;
   }
   items.forEach((item, index) => {
     const enabled = item.enabled !== false;
-    const row = document.createElement("div"); row.className = `schedule-row${enabled ? "" : " is-disabled"}`; row.dataset.scheduleRow = String(index); row.dataset.enabled = String(enabled);
+    const row = document.createElement("div"); row.className = `schedule-row${enabled ? "" : " is-disabled"}`; row.dataset.scheduleRow = String(index); row.dataset.enabled = String(enabled); row.dataset.scheduleOperation = scheduleOperation(item);
     const copy = document.createElement("div"); copy.className = "schedule-copy";
     const cron = document.createElement("code"); cron.textContent = item.cron;
-    const profile = document.createElement("strong"); profile.textContent = profileLabel(item.profile);
-    const next = document.createElement("span"); next.className = "schedule-state"; next.textContent = enabled ? `next: ${scheduleDateLabel(item.next_fire)}` : "Disabled · no next fire";
-    copy.append(cron, profile, next);
+    const operation = document.createElement("strong"); operation.className = "schedule-operation"; operation.textContent = scheduleOperationLabel(item);
+    const profile = document.createElement("span"); profile.className = "schedule-target"; profile.textContent = profileLabel(item.profile);
+    const next = document.createElement("span"); next.className = "schedule-state";
+    const nextDate = item.next_fire ? new Date(item.next_fire) : null;
+    next.textContent = !enabled
+      ? "Disabled · no next fire"
+      : nextDate && !Number.isNaN(nextDate.getTime())
+      ? `next: ${scheduleDateLabel(item.next_fire)} ${scheduleTimezoneName()} · ${scheduleUtcLabel(item.next_fire)}`
+      : "next: unknown";
+    copy.append(cron, operation, profile, next);
     const actions = document.createElement("div"); actions.className = "schedule-actions";
     const toggle = document.createElement("button"); toggle.className = "button button-small button-quiet schedule-toggle"; toggle.type = "button"; toggle.setAttribute("role", "switch"); toggle.setAttribute("aria-checked", String(enabled)); toggle.textContent = enabled ? "Enabled" : "Disabled"; toggle.setAttribute("aria-label", `${enabled ? "Disable" : "Enable"} schedule for ${profileLabel(item.profile)} at ${item.cron}`);
     toggle.dataset.scheduleToggle = String(index);
     toggle.addEventListener("click", () => toggleSchedule(index, item, toggle));
     const remove = document.createElement("button"); remove.className = "button button-small button-danger"; remove.type = "button"; remove.dataset.scheduleRemove = String(index); remove.textContent = "Remove"; remove.setAttribute("aria-label", `Remove schedule for ${profileLabel(item.profile)} at ${item.cron}`);
     remove.addEventListener("click", () => removeSchedule(index, item));
+    if (!SCHEDULE_OPERATIONS.includes(scheduleOperation(item))) {
+      // Editing is replaced by a whole-book write, so an entry this console
+      // cannot represent is guarded instead of rewritten from a guess.
+      const guard = "This entry uses an operation this console does not understand; edit it with the controller tools.";
+      [toggle, remove].forEach((control) => { control.disabled = true; control.title = guard; });
+      toggle.setAttribute("aria-label", `${toggle.getAttribute("aria-label")} (unsupported operation)`);
+      remove.setAttribute("aria-label", `${remove.getAttribute("aria-label")} (unsupported operation)`);
+    }
     actions.append(toggle, remove); row.append(copy, actions); list.append(row);
   });
 }
@@ -3204,6 +3941,15 @@ function renderScheduleRows(items) {
 async function renderSchedules() {
   if (!byId("schedule-list")) return;
   renderScheduleProfiles();
+  const timezone = byId("schedule-timezone");
+  if (timezone) timezone.textContent = `Cron expressions are evaluated in UTC by the controller. Next runs are shown in ${scheduleTimezoneName()} and in UTC.`;
+  renderSchedulePreview();
+  if (state.focusSchedules) {
+    state.focusSchedules = false;
+    const heading = byId("schedules-title");
+    heading?.scrollIntoView({ block: "start" });
+    heading?.focus({ preventScroll: true });
+  }
   try {
     state.detail.schedules = await loadSchedules();
     renderScheduleRows(state.detail.schedules);
@@ -3223,19 +3969,15 @@ async function loadSchedules() {
 }
 
 function schedulePayload(item) {
-  return {
-    cron: item.cron,
-    profile: item.profile,
-    enabled: item.enabled !== false,
-    ...(item.backup_destination ? { backup_destination: item.backup_destination } : {}),
-    ...(item.operation ? { operation: item.operation } : {}),
-    ...(item.baseline_preset ? { baseline_preset: item.baseline_preset } : {}),
-    ...(item.candidate_preset ? { candidate_preset: item.candidate_preset } : {}),
-    ...(item.campaign ? { campaign: item.campaign } : {}),
-    maintenance_window: item.maintenance_window === true,
-    rollback_safe: item.rollback_safe === true,
-    public_wake_policy: item.public_wake_policy || "disabled",
-  };
+  // Replace the whole schedule book, so every stored field has to survive an
+  // unrelated edit: keep the cron text, the operation and the backup/benchmark
+  // policy exactly as the controller reported them.
+  const payload = { cron: item.cron, profile: item.profile, enabled: item.enabled !== false };
+  ["backup_destination", "operation", "baseline_preset", "candidate_preset", "campaign", "maintenance_window", "rollback_safe", "public_wake_policy"].forEach((key) => {
+    if (item[key] === undefined || item[key] === null) return;
+    payload[key] = item[key];
+  });
+  return payload;
 }
 
 async function replaceSchedules(entries, confirmation) {
@@ -3254,11 +3996,15 @@ async function addSchedule(event) {
   const cron = byId("schedule-cron").value.trim();
   const profile = byId("schedule-profile").value;
   if (!cron || !profile) return;
+  // The add form only creates profile switches; a backup or benchmark entry
+  // carries policy this form does not collect, so it is never created here.
+  if (!scheduleDraftState().next) { renderSchedulePreview(); return; }
   const entries = [...(state.detail.schedules || []).map(schedulePayload), { cron, profile, enabled: true, operation: "switch", maintenance_window: false, rollback_safe: false, public_wake_policy: "disabled" }];
   try {
-    const changed = await replaceSchedules(entries, `Add schedule ${cron} for ${profileLabel(profile)}?`);
+    const changed = await replaceSchedules(entries, `Add automation "${cron}" that switches the active server to ${profileLabel(profile)}?`);
     if (changed) {
       byId("schedule-cron").value = "";
+      renderSchedulePreview();
       byId("schedule-cron").focus();
     }
   } catch (error) { byId("schedule-status").textContent = error.message || "Schedule update failed."; }
@@ -3268,7 +4014,7 @@ async function removeSchedule(index, item) {
   const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(schedulePayload);
   const nextFocusIndex = Math.min(index, entries.length - 1);
   try {
-    const changed = await replaceSchedules(entries, `Remove schedule ${item.cron} for ${profileLabel(item.profile)}?`);
+    const changed = await replaceSchedules(entries, `Remove ${scheduleOperationLabel(item)} automation for ${profileLabel(item.profile)} at ${item.cron}?`);
     if (changed) {
       const next = nextFocusIndex >= 0 ? byId("schedule-list").querySelectorAll("[data-schedule-remove]")[nextFocusIndex] : null;
       (next || byId("schedule-cron")).focus();
@@ -3455,9 +4201,15 @@ async function fetchUpdateStatus(id) {
   return status;
 }
 
-async function checkForUpdate(id) {
+async function checkForUpdate(id, task = "check") {
   try {
     const status = await fetchUpdateStatus(id);
+    state.updates.set(id, { status, fetchedAt: Date.now(), task });
+    renderUpdateCheckResult(id);
+    // The response may land after the reader left this profile or the detail
+    // view. The result is still cached for its own profile, but it must not
+    // steer the dialog or the profile now on screen.
+    if (state.detail.id !== id || !detailViewActive()) return;
     const checkState = status.state || (status.available_version ? "available" : "current");
     if (checkState === "failed") {
       notify(status.message || `Update check failed for ${profileLabel(id)}.`);
@@ -3498,7 +4250,11 @@ async function checkForUpdate(id) {
     confirm.disabled = automatic;
     confirm.textContent = "Apply update";
     setupDialog(byId("update-dialog"), byId("check-update"));
-  } catch (error) { notify(error.message || "Update check failed."); }
+  } catch (error) {
+    state.updates.set(id, { status: null, fetchedAt: Date.now(), task, error: error.message || "Update check failed." });
+    renderUpdateCheckResult(id);
+    if (state.detail.id === id && detailViewActive()) notify(error.message || "Update check failed.");
+  }
 }
 
 function renderDetailLogs(item) {
@@ -3568,8 +4324,6 @@ async function loadBackups(id) {
   try {
     const page = await api(`/api/v1/profiles/${encodeURIComponent(id)}/backups?limit=200`);
     state.detail.backups = Array.isArray(page.items) ? page.items : [];
-    const latest = state.detail.backups[0];
-    byId("switch-backup").textContent = latest?.created_at ? new Date(latest.created_at).toLocaleString() : "No recent backup recorded";
   } catch { state.detail.backups = []; }
   list.replaceChildren();
   state.detail.backups.forEach((backup) => {
@@ -3625,18 +4379,21 @@ async function renderAggregateBackups() {
 function route() {
   const parsed = routeFromHash();
   if (parsed.view === "detail") {
-    if (!state.profiles.has(parsed.id)) {
+    if (!state.profiles.has(parsed.id) || !profileIsConfigured(parsed.id)) {
       state.detail.id = null;
       showView("dashboard");
       return;
     }
+    if (state.detail.id !== parsed.id) state.detail.statsTracking = null;
     state.detail.id = parsed.id;
+    state.detail.focusSection = parsed.section === "players" ? "players" : null;
     showView("detail"); patchDetail(state.detail.id); setDetailTab(parsed.tab);
   } else {
     clearStatsTimer();
     clearMetricTimer();
     clearBenchmarkTimer();
     state.detail.id = null;
+    state.detail.focusSection = null;
     showView(parsed.view);
     if (parsed.view === "backups") renderAggregateBackups();
     if (parsed.view === "events") { loadIncidents(); loadActivity("events"); }
@@ -3671,10 +4428,26 @@ function setupDetail() {
   byId("check-update")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     if (button.disabled) return;
+    const id = state.detail.id;
+    if (!id) return;
     button.disabled = true;
-    try { await checkForUpdate(state.detail.id); }
+    const previous = state.updates.get(id);
+    state.updates.set(id, { pending: true, task: "check", fetchedAt: previous?.fetchedAt || null });
+    renderUpdateCheckResult(id);
+    try { await checkForUpdate(id); }
     finally { button.disabled = false; }
   });
+  document.querySelectorAll("[data-settings-jump]").forEach((link) => link.addEventListener("click", (event) => {
+    event.preventDefault();
+    window.location.hash = "#/settings";
+    // The destination section is hidden until the settings view is shown; show
+    // it before focusing so the toggle is actually visible and focusable.
+    showView("settings");
+    const target = byId(link.dataset.settingsJump);
+    const focusTarget = target?.querySelector("[data-settings-target]");
+    target?.scrollIntoView({ block: "center" });
+    focusTarget?.focus({ preventScroll: true });
+  }));
   byId("command-send").addEventListener("click", sendConsoleCommand);
   byId("console-output").addEventListener("scroll", (event) => {
     const id = state.detail.id;
@@ -3712,6 +4485,7 @@ function setupDetail() {
   });
   byId("console-save-as-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!actionSubmitter(event, byId("console-save-as-dialog"), byId("console-export-submit"))) return;
     await saveConsoleAs();
   });
   byId("command-input").addEventListener("keydown", (event) => {
@@ -3723,10 +4497,20 @@ function setupDetail() {
   byId("detail-log-query").addEventListener("input", () => { const item = state.logs.get(state.detail.id); if (item) { item.query = byId("detail-log-query").value; renderDetailLogs(item); } });
   byId("detail-log-severity").addEventListener("change", () => { const item = state.logs.get(state.detail.id); if (item) { item.severity = byId("detail-log-severity").value; renderDetailLogs(item); } });
   byId("detail-log-pause").addEventListener("click", () => { const item = state.logs.get(state.detail.id); if (item) { item.paused = !item.paused; byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs"; } });
-  byId("stats-window").addEventListener("change", () => { if (state.detail.tab === "stats") { state.detail.statsBaseLoaded = false; loadStats(state.detail.id, { includeBase: true }); } });
+  byId("stats-window").addEventListener("change", () => {
+    if (state.detail.tab !== "stats") return;
+    state.detail.statsBaseLoaded = false;
+    state.detail.statsBaseWindow = null;
+    patchStatsBaseNotice();
+    loadStats(state.detail.id, { includeBase: true });
+  });
   byId("stats-resolution")?.addEventListener("change", () => { if (state.detail.tab === "stats") loadStats(state.detail.id, { includeBase: false }); });
+  byId("recorder-filter")?.addEventListener("change", () => { recorderTable.page = 1; rerenderRecorderTable(); });
+  byId("recorder-page-size")?.addEventListener("change", () => { recorderTable.page = 1; rerenderRecorderTable(); });
+  byId("recorder-prev")?.addEventListener("click", () => { recorderTable.page -= 1; rerenderRecorderTable(); });
+  byId("recorder-next")?.addEventListener("click", () => { recorderTable.page += 1; rerenderRecorderTable(); });
   byId("stats-comparison")?.addEventListener("change", () => {
-    const cached = state.statsCache.get(state.detail.id)?.tps;
+    const cached = cachedStatsTps(state.detail.id);
     if (cached) { byId("stats-tps-chart").dataset.signature = ""; renderStatsTps(cached); }
   });
   byId("benchmark-form")?.addEventListener("submit", runBenchmark);
@@ -3737,6 +4521,8 @@ function setupDetail() {
   byId("benchmark-candidate")?.addEventListener("change", validateBenchmarkForm);
   byId("config-form")?.addEventListener("submit", applyConfig);
   byId("schedule-form")?.addEventListener("submit", addSchedule);
+  byId("schedule-cron")?.addEventListener("input", renderSchedulePreview);
+  byId("settings-schedules-link")?.addEventListener("click", () => { state.focusSchedules = true; });
   byId("detail-noise-toggle").addEventListener("change", (event) => { const item = state.logs.get(state.detail.id); if (item) { item.hideNoise = event.currentTarget.checked; renderDetailLogs(item); patchDetail(state.detail.id); } });
   // Recurring timer: console/log append poll; callback is visibility-gated.
   window.setInterval(() => {
@@ -3756,7 +4542,7 @@ function refreshVisiblePanels() {
     const item = state.logs.get(id);
     if (!item?.paused) loadDetailLogs(id);
   } else if (state.detail.tab === "stats") {
-    loadStats(id, { includeBase: !state.detail.statsBaseLoaded });
+    loadStats(id, { includeBase: !statsBaseReady() });
   } else if (state.detail.tab === "metrics") {
     loadMetricHistory(id);
   } else if (state.detail.tab === "benchmarks") {
@@ -3782,10 +4568,21 @@ function paletteCommands() {
   addNavigation("events", "Go to Events", "#/events", "activity history");
   addNavigation("audit", "Go to Audit", "#/audit", "log review security");
   addNavigation("settings", "Go to Settings", "#/settings", "preferences notifications performance");
+  const scheduleProfile = schedulesProfileId();
+  if (scheduleProfile) commands.push({
+    id: "scheduled-automations",
+    label: "Open scheduled automations",
+    group: "Navigate",
+    keywords: `schedule schedules scheduling automation automations cron backup backup destination timetable ${scheduleProfile} ${profileLabel(scheduleProfile)}`,
+    run: () => openSchedules(),
+  });
 
   const tabLabels = { console: "Console", metrics: "Metrics", stats: "Stats", logs: "Logs", backups: "Backups", benchmarks: "Benchmarks", config: "Config" };
   const owner = slotOwnerId();
   profileOrder().forEach((id) => {
+    // Placeholder ids are dashboard-only: navigating or acting on them would
+    // bounce off route()/the controller with no explanation.
+    if (!profileIsConfigured(id)) return;
     const profile = detailProfile(id);
     const display = profile.display_name || id;
     Object.entries(tabLabels).filter(([tab]) => tab !== "benchmarks" || new Set(profile.operations || []).has("benchmark")).forEach(([tab, tabLabel]) => addNavigation(
@@ -3843,7 +4640,7 @@ window.HORIZON_PALETTE = { getCommands: paletteCommands };
 window.addEventListener("game-control-status", (event) => applyStatus(event.data || event.detail));
 window.addEventListener("resize", () => {
   if (state.detail.tab !== "stats" || !state.detail.id) return;
-  const cached = state.statsCache.get(state.detail.id)?.tps;
+  const cached = cachedStatsTps(state.detail.id);
   if (cached) renderStatsTps(cached);
 });
 document.addEventListener("visibilitychange", () => {
@@ -3900,6 +4697,13 @@ if (window.__HORIZON_TEST__) {
     setReconnectTestTiming: (delay, jitter = () => 0) => { stream.retryMs = delay; reconnectJitter = jitter; },
     setUpdatePollTiming: (delay, attempts = updatePollAttempts) => { updatePollDelay = delay; updatePollAttempts = attempts; },
     delayNextApiResponse: () => { testApiResponseDelay += 1; },
+    cronPreview: (expression, isoFrom = null) => {
+      const parsed = parseCronExpression(expression);
+      if (!parsed) return null;
+      const next = cronNextFire(parsed, isoFrom ? new Date(isoFrom) : new Date());
+      return next ? next.toISOString() : null;
+    },
+    configuredProfiles: () => [...state.configuredProfiles],
   };
 }
 window.addEventListener("hashchange", route);
