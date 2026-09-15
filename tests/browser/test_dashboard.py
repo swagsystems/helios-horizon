@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, expect
 
-from browser_harness import browser_page
+from browser_harness import browser_page, suspend_background_status
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -414,10 +414,69 @@ def test_empty_slot_copy_and_owner_dot(page: Page):
     assert page.locator(".server-dot.is-owner").count() == 0
 
 
+def test_confirmed_offline_profile_shows_offline_for_players_uptime_and_health(page: Page):
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 50, profiles: [{profile_id: 'minecraft', state: 'stopped', health: 'unknown',
+            slot_owner: null, pid: null, players_online: 0, uptime_seconds: 0, required_ports_ready: false}]
+        }}))"""
+    )
+    assert page.locator('[data-profile-id="minecraft"] .metric-players').inner_text() == "Offline"
+    assert page.locator("#active-players").inner_text() == "Offline"
+    assert page.locator("#active-uptime").inner_text() == "Offline"
+    assert page.locator("#active-health").inner_text() == "Offline"
+    assert page.locator("#active-slot-summary").inner_text() == "Offline. Horizon can start it now."
+
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/metrics")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    assert "state-stopped" in page.locator("#detail-status").get_attribute("class")
+    assert page.locator("#rail-players").inner_text() == "Offline"
+    assert page.locator("#rail-players-note").inner_text() == "Server is offline"
+    assert page.locator("#metric-players-current").inner_text() == "Offline"
+    assert page.locator("#metric-uptime").inner_text() == "Offline"
+
+
+def test_running_profile_with_zero_players_is_not_offline(page: Page):
+    page.evaluate(
+        """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 51, profiles: [{profile_id: 'minecraft', state: 'running', health: 'healthy',
+            slot_owner: 'minecraft', pid: 202, players_online: 0, uptime_seconds: 0,
+            required_ports_ready: true}]
+        }}))"""
+    )
+    assert page.locator('[data-profile-id="minecraft"] .metric-players').inner_text() == "0 players"
+    assert page.locator("#active-players").inner_text() == "0"
+    assert page.locator("#active-uptime").inner_text() == "0m"
+    assert page.locator("#active-health").inner_text() == "Healthy"
+
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/metrics")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    assert page.locator("#rail-players").inner_text() == "0"
+    assert page.locator("#metric-players-current").inner_text() == "0"
+    assert page.locator("#metric-uptime").inner_text() == "0m"
+    assert page.locator("#detail-view").get_by_text("Offline", exact=True).count() == 0
+
+
+@pytest.mark.parametrize("state", ["starting", "stopping", "unknown"])
+def test_transition_and_unknown_states_do_not_become_offline(page: Page, state: str):
+    page.evaluate(
+        """state => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
+          generation: 52, profiles: [{profile_id: 'minecraft', state, health: 'unknown',
+            slot_owner: state === 'stopping' ? 'minecraft' : null, pid: state === 'stopping' ? 202 : null,
+            players_online: 0, uptime_seconds: 0, required_ports_ready: false}]
+        }}))""",
+        state,
+    )
+    assert page.locator("#active-players").inner_text() == "0"
+    assert page.locator("#active-uptime").inner_text() == "0m"
+    assert page.locator("#active-health").inner_text() == "Unknown"
+    assert page.locator("#active-players").inner_text() != "Offline"
+
+
 def test_session_deck_explains_readiness_and_recovery_states(page: Page):
     assert page.locator("#session-endpoint").inner_text() == "mc.example.test"
     assert page.get_by_role("button", name="Copy Minecraft join address", exact=True).is_visible()
-    assert page.locator('#session-runway [data-state="complete"]').count() == 4
+    assert page.locator('#session-runway [data-state="complete"]').count() == 3
     page.wait_for_function("document.querySelector('#session-backup').textContent.includes('Verified')")
     assert page.locator("#session-backup").inner_text().startswith("Verified ")
 
@@ -431,7 +490,7 @@ def test_session_deck_explains_readiness_and_recovery_states(page: Page):
     assert page.locator("#active-slot-summary").inner_text() == "Start accepted. Waiting for the server process."
     assert page.locator('[data-session-phase="process"]').get_attribute("data-state") == "active"
     assert page.locator('[data-session-phase="process"]').get_attribute("aria-current") == "step"
-    assert page.locator("#session-readiness-summary").text_content() == "Readiness: 1 of 4 checks complete · process in progress"
+    assert page.locator("#session-readiness-summary").text_content() == "Readiness: 1 of 3 stages complete · starting in progress"
     assert page.locator("#active-players").inner_text() == "Not observed"
 
     page.evaluate(
@@ -442,8 +501,9 @@ def test_session_deck_explains_readiness_and_recovery_states(page: Page):
         }}))"""
     )
     assert page.locator("#active-slot-summary").inner_text() == "The server process is loading. Waiting for the game port."
-    assert page.locator('[data-session-phase="process"]').get_attribute("data-state") == "complete"
-    assert page.locator('[data-session-phase="port"]').get_attribute("data-state") == "active"
+    assert page.locator('[data-session-phase="process"]').get_attribute("data-state") == "active"
+    assert page.locator('[data-session-phase="port"]').count() == 0
+    assert page.locator('[data-session-phase="ready"]').get_attribute("data-state") == "waiting"
 
     page.evaluate(
         """() => window.dispatchEvent(new MessageEvent('game-control-status', {data: {
@@ -514,7 +574,8 @@ def test_session_deck_primary_start_uses_existing_typed_mutation(page: Page):
     page.wait_for_function("document.querySelector('#session-operation').dataset.result === 'accepted'")
     operation = page.locator("#session-operation").inner_text()
     assert "Start accepted by Horizon. Job job-42." in operation
-    assert "This tab notice is transient; the Audit trail is durable." in operation
+    assert "Horizon" in operation
+    assert "This tab notice is transient; the Audit trail is durable." not in operation
 
 
 def test_session_deck_keeps_mutation_failure_visible(page: Page):
@@ -570,11 +631,11 @@ def test_observed_completion_is_not_overwritten_by_late_post_ack(page: Page):
         }}))"""
     )
     assert page.locator("#session-operation").get_attribute("data-result") == "complete"
-    assert page.locator("#session-operation").inner_text() == "Minecraft reached healthy game readiness. This tab notice is transient; the Audit trail is durable."
+    assert page.locator("#session-operation").inner_text() == "Minecraft is ready."
     page.evaluate("window.__resolveStart()")
     page.wait_for_timeout(50)
     assert page.locator("#session-operation").get_attribute("data-result") == "complete"
-    assert page.locator("#session-operation").inner_text() == "Minecraft reached healthy game readiness. This tab notice is transient; the Audit trail is durable."
+    assert page.locator("#session-operation").inner_text() == "Minecraft is ready."
 
 
 def test_update_check_requires_explicit_review_before_mutation(page: Page):
@@ -604,6 +665,112 @@ def test_update_check_requires_explicit_review_before_mutation(page: Page):
     dialog.get_by_role("button", name="Apply update", exact=True).click()
     page.wait_for_function("document.querySelector('#update-dialog').open === false")
     assert posts == ["/api/v1/profiles/minecraft/update/prepare", "/api/v1/update/confirm"]
+
+
+def test_automatic_update_status_shows_available_without_generic_apply(page: Page):
+    posts = []
+
+    def update_route(route):
+        request = route.request
+        if request.method == "GET":
+            return route.fulfill(json={
+                "profile_id": "minecraft",
+                "strategy": "manual",
+                "installed_version": "1.1.3-SSV4.1.4",
+                "available_version": "1.1.4-SSV4.1.5",
+                "restart_required": False,
+                "apply_supported": False,
+                "state": "available",
+                "message": None,
+                "checked_at": "2026-09-13T18:00:00Z",
+            })
+        posts.append(urlparse(request.url).path)
+        return route.fulfill(json={"ok": True})
+
+    page.route("**/api/v1/profiles/minecraft/update**", update_route)
+    page.route("**/api/v1/update/confirm", update_route)
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/console")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    page.get_by_role("button", name="Check for updates", exact=True).click()
+    page.wait_for_selector("#update-dialog[open]")
+
+    dialog = page.get_by_role("dialog", name="Automatic update available")
+    assert dialog.get_by_text("1.1.4-SSV4.1.5", exact=True).is_visible()
+    assert dialog.get_by_role("button", name="Apply update", exact=True).is_hidden()
+    assert posts == []
+
+
+@pytest.mark.parametrize(
+    ("state", "message", "expected"),
+    [
+        ("failed", "Update check failed.", "Update check failed."),
+        ("checking", "An update check is already in progress.", "An update check is already in progress."),
+        ("deferred", "The automatic update is deferred.", "The automatic update is deferred."),
+        ("stale", "The update status is stale.", "The update status is stale."),
+    ],
+)
+def test_update_check_non_current_states_are_not_reported_as_no_update(
+    page: Page, state: str, message: str, expected: str,
+):
+    def update_route(route):
+        return route.fulfill(json={
+            "profile_id": "minecraft",
+            "strategy": "manual",
+            "installed_version": "1.1.3-SSV4.1.4",
+            "available_version": None,
+            "restart_required": False,
+            "apply_supported": False,
+            "state": state,
+            "message": message,
+        })
+
+    page.route("**/api/v1/profiles/minecraft/update**", update_route)
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/console")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    page.evaluate("window.__horizonTest.setUpdatePollTiming(1, 2)")
+    page.get_by_role("button", name="Check for updates", exact=True).click()
+
+    expect(page.locator("#status-announcer")).to_have_text(expected)
+    assert page.locator("#update-dialog[open]").count() == 0
+
+
+def test_update_check_polling_finishes_slow_discovery_without_second_click(page: Page):
+    calls = 0
+
+    def update_route(route):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return route.fulfill(json={
+                "profile_id": "minecraft",
+                "strategy": "manual",
+                "installed_version": "1.1.3-SSV4.1.4",
+                "available_version": None,
+                "restart_required": False,
+                "apply_supported": False,
+                "state": "checking",
+                "message": "An update check is in progress.",
+            })
+        return route.fulfill(json={
+            "profile_id": "minecraft",
+            "strategy": "manual",
+            "installed_version": "1.1.3-SSV4.1.4",
+            "available_version": "1.1.4-SSV4.1.5",
+            "restart_required": False,
+            "apply_supported": False,
+            "state": "available",
+            "message": None,
+        })
+
+    page.route("**/api/v1/profiles/minecraft/update**", update_route)
+    page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/console")
+    page.wait_for_selector("#detail-view:not([hidden])")
+    page.evaluate("window.__horizonTest.setUpdatePollTiming(1, 3)")
+    page.get_by_role("button", name="Check for updates", exact=True).click()
+    page.wait_for_selector("#update-dialog[open]")
+
+    assert calls >= 2
+    page.get_by_role("dialog", name="Automatic update available").get_by_text("1.1.4-SSV4.1.5", exact=True).is_visible()
 
 
 def test_schedule_management_updates_live_automation_summary(page: Page):
@@ -1162,6 +1329,7 @@ def test_flight_recorder_stops_polling_while_document_is_hidden(page: Page):
 
 
 def test_visible_resume_pauses_mutations_until_fresh_status_arrives(page: Page):
+    suspend_background_status(page)
     pending = []
 
     def hold_status(route):
@@ -1299,6 +1467,8 @@ def test_sse_replacements_carry_cursor_and_accept_only_newer_ids(page: Page):
     """)
     page.reload()
     page.wait_for_function("window.__mockSse?.opens === 1")
+    # Empty cursor-only events intentionally do not reset data-recovery backoff.
+    page.evaluate("window.__horizonTest.setReconnectTestTiming(1)")
     page.evaluate("window.__appliedGenerations = []; window.addEventListener('horizon:status-applied', event => window.__appliedGenerations.push(event.detail.generation))")
     page.evaluate("window.__mockSse.instances[0].emit('status', {generation: 1, profiles: []}, '41')")
     page.evaluate("""() => {
@@ -1619,6 +1789,7 @@ def test_malformed_and_unknown_server_hashes_fall_back_to_dashboard(page: Page):
 
 
 def test_session_refresh_is_single_flight_and_preserves_mutation_key(page: Page):
+    suspend_background_status(page)
     page._allow_expected_http_errors = True  # type: ignore[attr-defined]
     counts = {"session": 0, "status": 0, "mutation": 0}
 
@@ -1686,6 +1857,7 @@ def test_typed_non_csrf_403_does_not_probe_or_expire_session(page: Page):
 
 def test_concurrent_opaque_redirects_have_one_expiry_transition(page: Page):
     page._allow_expected_http_errors = True  # type: ignore[attr-defined]
+    suspend_background_status(page)
     redirects = 0
 
     def redirect(route):
@@ -1726,6 +1898,7 @@ def test_transient_session_refresh_failure_schedules_next_reconnect(page: Page):
 
 
 def test_late_old_generation_401_retries_without_second_session_refresh(page: Page):
+    suspend_background_status(page)
     page._allow_expected_http_errors = True  # type: ignore[attr-defined]
     session_probes = 0
     status_calls = 0
@@ -1755,6 +1928,7 @@ def test_late_old_generation_401_retries_without_second_session_refresh(page: Pa
 
 
 def test_terminal_401_after_refresh_retries_once_then_expires(page: Page):
+    suspend_background_status(page)
     page._allow_expected_http_errors = True  # type: ignore[attr-defined]
     session_probes = 0
     status_calls = 0
@@ -1782,6 +1956,7 @@ def test_terminal_401_after_refresh_retries_once_then_expires(page: Page):
 
 
 def test_api_401_with_transient_session_failure_does_not_expire_and_recovers(page: Page):
+    suspend_background_status(page)
     page._allow_expected_http_errors = True  # type: ignore[attr-defined]
     session_probes = 0
     status_calls = 0

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import grp
+import hashlib
 import os
+import secrets
 import stat
 import threading
 from pathlib import Path
@@ -264,6 +266,56 @@ def test_reservation_generation_provider_is_bound_at_commit(slot_env):
     assert not slot_env.store.owns_live(
         "minecraft", "update-generation", 16, operation_kind="update",
     )
+
+
+def test_update_handoff_capability_binds_exact_live_reservation(slot_env):
+    token = secrets.token_hex(32)
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    reservation = slot_env.store.reserve_if_available(
+        "minecraft", "handoff", ttl=10,
+        operation_kind="update",
+        capability_sha256=digest,
+    )
+    authorized = slot_env.store.authorize_handoff("minecraft", token)
+    assert authorized.operation_id == reservation.operation_id
+    assert authorized.capability_sha256 == digest
+    with pytest.raises(BlockingIOError):
+        slot_env.store.authorize_handoff("minecraft", secrets.token_hex(32))
+    with pytest.raises(BlockingIOError):
+        slot_env.store.authorize_handoff("pz-rising", token)
+    with pytest.raises(ValueError, match="handoff capability"):
+        slot_env.store.reserve("pz-rising", "life", ttl=10, capability_sha256=digest)
+
+
+def test_update_handoff_capability_survives_renewal(slot_env):
+    token = secrets.token_hex(32)
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    reservation = slot_env.store.reserve_if_available(
+        "minecraft", "handoff-renew", ttl=10,
+        operation_kind="update",
+        capability_sha256=digest,
+    )
+    renewed = slot_env.store.renew_if_owned(
+        "minecraft", "handoff-renew", ttl=20,
+        state_generation=reservation.state_generation,
+        operation_kind="update",
+    )
+    assert renewed.capability_sha256 == digest
+    assert slot_env.store.authorize_handoff("minecraft", token).operation_id == "handoff-renew"
+
+
+def test_update_handoff_capability_rejects_dead_owner(slot_env):
+    token = secrets.token_hex(32)
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    slot_env.store.reserve_if_available(
+        "minecraft", "handoff-dead", ttl=10,
+        controller_pid=999999,
+        controller_start_ticks=1,
+        operation_kind="update",
+        capability_sha256=digest,
+    )
+    with pytest.raises(BlockingIOError):
+        slot_env.store.authorize_handoff("minecraft", token)
 
 
 def test_update_reservation_is_not_runner_authorization(slot_env):

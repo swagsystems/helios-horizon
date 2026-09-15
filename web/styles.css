@@ -122,7 +122,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .nav-server { gap: var(--sp-3); font-size: .86rem; font-weight: 550; }
 .conn-pill { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 2px; padding: 2px 6px; color: var(--healthy); background: color-mix(in srgb, var(--healthy) 14%, transparent); font: 700 .62rem/1.4 ui-monospace, monospace; text-transform: lowercase; }
 .conn-pill[data-state="live"] { position: absolute; width: 1px; height: 1px; overflow: hidden; border: 0; margin: -1px; padding: 0; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
-.conn-pill[data-state="reconnecting"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.conn-pill[data-state="reconnecting"], .conn-pill[data-state="polling"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
 .conn-pill[data-state="offline"] { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
 .server-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: var(--muted); }
 .server-dot.is-owner { background: linear-gradient(180deg, var(--accent), var(--accent-deep)); }
@@ -179,7 +179,7 @@ h3 { font-size: 1rem; font-weight: 650; line-height: 1.2; }
 .manage-link { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; color: var(--ink); text-decoration: none; }
 .active-manage { width: fit-content; min-height: 34px; color: var(--ink); font-size: .78rem; font-weight: 650; }
 .active-manage[hidden] { display: none; }
-.session-runway { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: var(--sp-2) 0 0; padding: 0; list-style: none; }
+.session-runway { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: var(--sp-2) 0 0; padding: 0; list-style: none; }
 .session-runway li { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 17px auto auto; gap: 5px; min-width: 0; color: var(--muted); }
 .session-runway li::after { position: absolute; z-index: 0; top: 8px; left: 18px; width: calc(100% - 18px); height: 1px; background: var(--line); content: ""; }
 .session-runway li:last-child::after { display: none; }
@@ -192,6 +192,14 @@ h3 { font-size: 1rem; font-weight: 650; line-height: 1.2; }
 .session-runway li[data-state="active"] small { color: var(--warn); }
 .session-runway li[data-state="failed"] .runway-mark, .session-runway li[data-state="conflict"] .runway-mark { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 26%, var(--panel)); }
 .session-runway li[data-state="failed"] small, .session-runway li[data-state="conflict"] small { color: var(--danger); }
+.startup-estimate { display: grid; gap: var(--sp-2); max-width: 420px; margin: var(--sp-3) 0 0; }
+.startup-estimate-head { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: var(--sp-3); }
+.startup-estimate-note { overflow: hidden; color: var(--muted); font-size: .72rem; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.startup-estimate-track { position: relative; overflow: hidden; height: 6px; border: 1px solid var(--line); background: var(--panel); }
+.startup-estimate-fill { display: block; width: 0; height: 100%; background: var(--accent); transition: width .4s linear; }
+.startup-estimate-track[data-mode="learning"] .startup-estimate-fill { width: 0; background: var(--accent-deep); }
+.startup-estimate-track[data-mode="overrun"] .startup-estimate-fill { background: var(--warn); }
+.startup-estimate-track[data-mode="ready"] .startup-estimate-fill { background: var(--accent); }
 .session-facts { display: flex; min-width: 0; align-items: end; justify-content: space-between; gap: var(--sp-6); border-top: 1px solid var(--line); padding-top: var(--sp-4); }
 .session-endpoint { display: grid; grid-template-columns: minmax(0, auto) auto; align-items: center; gap: var(--sp-1) var(--sp-2); min-width: 0; }
 .session-endpoint .eyebrow { grid-column: 1 / -1; }
@@ -525,7 +533,9 @@ dd { margin: 4px 0 0; font-weight: 700; }
   .incident-topline { display: grid; align-items: start; }
   .incident-state { justify-self: start; }
   .app-shell { height: auto; }
-  .sidebar { position: fixed; z-index: 30; width: min(300px, calc(100% - 24px)); height: 100dvh; transform: translate3d(-105%, 0, 0); transition: transform .24s cubic-bezier(.2,.8,.2,1); will-change: transform; box-shadow: 22px 0 50px color-mix(in srgb, var(--shadow-base) 30%, transparent); }
+  /* The drawer owns its own scroll: the shell locks page-behind scrolling while
+     the drawer is open, so the nav and footer must be reachable inside it. */
+  .sidebar { position: fixed; z-index: 30; width: min(300px, calc(100% - 24px)); height: 100dvh; max-height: 100dvh; overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; -webkit-overflow-scrolling: touch; transform: translate3d(-105%, 0, 0); transition: transform .24s cubic-bezier(.2,.8,.2,1); will-change: transform; box-shadow: 22px 0 50px color-mix(in srgb, var(--shadow-base) 30%, transparent); }
   .sidebar[aria-hidden="false"] { transform: translateX(0); }
   .drawer-overlay { position: fixed; z-index: 20; inset: 0; background: var(--backdrop); }
   .drawer-close { display: block; }
@@ -546,6 +556,9 @@ dd { margin: 4px 0 0; font-weight: 700; }
   .session-runway .runway-mark { grid-row: 1 / span 2; }
   .session-runway li::after { top: 17px; left: 8px; width: 1px; height: calc(100% + var(--sp-2)); }
   .session-runway small { grid-column: 2 / -1; grid-row: 2; overflow-wrap: anywhere; }
+  .startup-estimate { max-width: 100%; }
+  .startup-estimate-head { flex-wrap: wrap; }
+  .startup-estimate-note { overflow: visible; text-overflow: clip; white-space: normal; }
   .session-facts { display: grid; align-items: start; gap: var(--sp-4); }
   .slot-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: start; gap: var(--sp-3); }
   .session-shortcuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }

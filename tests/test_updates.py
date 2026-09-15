@@ -24,6 +24,7 @@ from game_control.models import (
     ProfileId,
     UpdateSpec,
 )
+from game_control.protocol import UpdateStatus
 from game_control.updates import UpdateService
 
 
@@ -303,6 +304,41 @@ def test_curated_modpack_status_uses_pinned_candidate_and_active_link(tmp_path: 
     assert status.available_version == "1.1.2-SSV4.1.4"
     assert status.restart_required is True
     assert status.apply_supported is True
+
+
+def test_manual_profile_uses_bounded_read_only_checker(tmp_path: Path):
+    profile = _profile(tmp_path, ProfileId.MINECRAFT_SUNLIT_COBBLEMON, "manual")
+    calls = []
+
+    def checker(profile_id):
+        calls.append(profile_id)
+        return UpdateStatus(
+            profile_id=profile_id,
+            strategy="manual",
+            installed_version="1.1.3-SSV4.1.4",
+            available_version="1.1.4-SSV4.1.5",
+            restart_required=False,
+            apply_supported=False,
+            state="available",
+            message=None,
+        )
+
+    status = UpdateService(
+        {profile.id.value: profile},
+        manual_checker=checker,
+    ).check(profile.id)
+
+    assert calls == [profile.id]
+    assert status.state == "available"
+    assert status.available_version == "1.1.4-SSV4.1.5"
+    assert status.apply_supported is False
+
+
+def test_manual_profile_without_checker_is_unsupported_not_current(tmp_path: Path):
+    profile = _profile(tmp_path, ProfileId.MINECRAFT, "manual")
+    status = UpdateService({profile.id.value: profile}).check(profile.id)
+    assert status.state == "unsupported"
+    assert status.available_version is None
 
 
 @pytest.mark.parametrize(

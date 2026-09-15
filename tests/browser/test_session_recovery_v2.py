@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from test_dashboard import page  # re-use the authenticated browser fixture
+from browser_harness import suspend_background_status
 
 
 def test_hung_session_body_is_aborted_at_bootstrap_deadline(page):
+    suspend_background_status(page)
     page._allow_expected_http_errors = True  # type: ignore[attr-defined]
     page.route("**/api/v1/status", lambda route: route.fulfill(status=401, json={"error": {"message": "stale"}}))
     result = page.evaluate("""async () => {

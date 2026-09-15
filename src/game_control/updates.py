@@ -100,6 +100,7 @@ class UpdateService:
         http_client: Any | None = None,
         clock: Callable[[], float] | None = None,
         lease_check: Callable[[], bool] | None = None,
+        manual_checker: Callable[[Any], UpdateStatus] | None = None,
     ) -> None:
         if isinstance(profiles, Mapping):
             self.profiles = profiles
@@ -123,6 +124,7 @@ class UpdateService:
         self._close_task: asyncio.Task[None] | None = None
         self.clock = clock or time.time
         self.lease_check = lease_check
+        self.manual_checker = manual_checker
 
     async def _close_impl(self) -> None:
         if self._http_client_closed or not self._owns_http_client:
@@ -202,9 +204,44 @@ class UpdateService:
         profile_obj = self._profile(profile)
         strategy = self._strategy(profile_obj)
         installed = self._installed_version(profile_obj)
+        if strategy == "manual" and self.manual_checker is not None:
+            try:
+                result = self.manual_checker(profile_obj.id)
+            except Exception:
+                return UpdateStatus(
+                    profile_id=profile_obj.id,
+                    strategy="manual",
+                    installed_version=installed,
+                    available_version=None,
+                    restart_required=False,
+                    apply_supported=False,
+                    state="failed",
+                    message="Update check failed.",
+                )
+            if isinstance(result, UpdateStatus) and result.profile_id == profile_obj.id:
+                return result
+            return UpdateStatus(
+                profile_id=profile_obj.id,
+                strategy="manual",
+                installed_version=installed,
+                available_version=None,
+                restart_required=False,
+                apply_supported=False,
+                state="failed",
+                message="Update check returned an invalid result.",
+            )
         available = self._candidate_version(profile_obj)
         if available == installed:
             available = None
+        if strategy == "manual":
+            state = "unsupported"
+            message = "Update checks are not available for this profile."
+        elif available is None:
+            state = "current"
+            message = None
+        else:
+            state = "available"
+            message = None
         return UpdateStatus(
             profile_id=profile_obj.id,
             strategy=strategy,
@@ -212,6 +249,8 @@ class UpdateService:
             available_version=available,
             restart_required=strategy != "manual",
             apply_supported=strategy != "manual",
+            state=state,
+            message=message,
         )
 
     @staticmethod

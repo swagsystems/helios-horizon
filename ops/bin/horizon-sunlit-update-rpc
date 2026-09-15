@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import os
+import re
+import sys
 from uuid import UUID
 
 from game_control.models import BackupDestination
@@ -18,7 +21,42 @@ from game_control.protocol import (
 )
 
 
-async def request_backup(request_id: UUID) -> dict:
+_CAPABILITY_RE = re.compile(rb"\A[0-9a-f]{64}\Z")
+_CAPABILITY_LINE_LENGTH = 65  # 64 lowercase hex characters plus one newline
+# Read one sentinel byte beyond the exact line so trailing input is detected
+# instead of silently accepted (EOF is guaranteed by the caller closing stdin).
+_CAPABILITY_READ_LIMIT = _CAPABILITY_LINE_LENGTH + 1
+
+
+class MalformedCapability(ValueError):
+    """The stdin capability line was missing, oversized or not exact."""
+
+
+def read_capability(stream: "io.BufferedReader") -> str:
+    """Consume one bounded, exact capability line from the private stdin pipe.
+
+    The payload must be exactly 64 lowercase-hex characters followed by one
+    newline.  Trailing input or a missing newline is rejected.  The raw input is
+    never echoed or attached to the error, so a malformed or hostile value
+    cannot leak through diagnostics.
+    """
+    raw = stream.read(_CAPABILITY_READ_LIMIT)
+    if raw is None:
+        raw = b""
+    if len(raw) != _CAPABILITY_LINE_LENGTH or not raw.endswith(b"\n"):
+        raise MalformedCapability("capability input is malformed")
+    value = raw[:-1]
+    if _CAPABILITY_RE.fullmatch(value) is None:
+        raise MalformedCapability("capability input is malformed")
+    return value.decode("ascii")
+
+
+async def request_backup(
+    request_id: UUID,
+    reservation_capability: str,
+    *,
+    socket_path: str = "/run/game-control/control.sock",
+) -> dict:
     request = RpcRequest(
         request_id=request_id,
         actor="sunlit-auto-update",
@@ -27,10 +65,11 @@ async def request_backup(request_id: UUID) -> dict:
             profile_id=ProfileId.MINECRAFT_SUNLIT_COBBLEMON,
             protected=True,
             destination=BackupDestination.HORIZON_B2,
+            reservation_capability=reservation_capability,
         ),
     )
     reader, writer = await asyncio.wait_for(
-        asyncio.open_unix_connection("/run/game-control/control.sock"), 15
+        asyncio.open_unix_connection(socket_path), 15
     )
     try:
         writer.write(request.model_dump_json().encode("utf-8") + b"\n")
@@ -56,7 +95,16 @@ def main(argv: list[str] | None = None) -> int:
     if os.geteuid() == 0:
         parser.error("run as the gamecontrol socket peer, not root")
     try:
-        print(json.dumps(asyncio.run(request_backup(args.request_id)), sort_keys=True))
+        reservation_capability = read_capability(sys.stdin.buffer)
+    except MalformedCapability:
+        # Fixed category only; the offending bytes are never echoed.
+        print("error: reservation capability input is malformed", file=sys.stderr)
+        return 2
+    try:
+        print(json.dumps(
+            asyncio.run(request_backup(args.request_id, reservation_capability)),
+            sort_keys=True,
+        ))
     except TimeoutError as exc:
         print(f"deferred: {exc}", file=os.sys.stderr)
         return 75

@@ -32,6 +32,16 @@ from .errors import SafeError
 from .maintenance_process import maintenance_argv, maintenance_popen
 from .models import BackupDestination, ProfileId
 from .protocol import BackupPage, BackupSummary, JobAccepted
+from .retirement import (
+    MANIFEST_DIR,
+    RETIREMENT_PHASES,
+    SENDER_LOCK_PATH,
+    PayloadState,
+    RetirementService,
+    SenderInterlock,
+    blocking_backup_ids,
+    noreplace_supported,
+)
 
 
 def _rpc_key(value: Any) -> str:
@@ -375,11 +385,13 @@ class B2ProtectionService:
         transport: B2Transport,
         destination: B2DestinationConfig = B2_DESTINATION,
         clock: Callable[[], datetime] | None = None,
+        availability: Callable[[str], str] | None = None,
     ) -> None:
         self.database = database
         self.transport = transport
         self.destination = destination
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.availability = availability
         self._memory: dict[tuple[str, str, str], ProtectionRecord] = {}
         self._lock = threading.RLock()
 
@@ -407,6 +419,9 @@ class B2ProtectionService:
         validate_destination(self.destination.destination_id, record.profile_id)
         prefix = b2_prefix(record.profile_id, backup_class)
         remote_key = f"{prefix}/{record.id}{_ARCHIVE_SUFFIX}"
+        # Admission must precede any read/hash of the payload.
+        if self.availability is not None and self.availability(record.id) != PayloadState.PRESENT.value:
+            raise SafeError("backup_protection_failed", "local backup payload is not available")
         digest = _sha256(record.path)
         if not record.verified or not record.path.is_file():
             self._save(record, backup_class, remote_key, digest, "not_started", False, "not_started", "not_started", "local_unverified")
@@ -949,12 +964,41 @@ class BackupService:
         candidates = [item for item in records if item not in retained]
         if len(records) == 1 and candidates:
             raise SafeError("backup_retention", "refusing to delete the only verified backup")
+        # Fail closed for the whole batch as soon as any candidate is
+        # catalog-backed: the legacy path has no lease, no ledger, and no
+        # reference protection, so deleting a catalogued payload cannot be made
+        # safe here.  Only a purely filesystem-level archive may be pruned.
+        self._assert_legacy_prune_safe(candidates)
         for item in candidates:
             item.path.unlink(missing_ok=True)
             self._delete(item.id)
         if records and not any(item.path.exists() for item in retained):
             raise SafeError("backup_retention", "refusing to delete the only verified backup")
         return tuple(sorted((item for item in retained if item.path.exists()), key=lambda x: x.created_at, reverse=True))
+
+    def _assert_legacy_prune_safe(self, candidates: list[BackupRecord]) -> None:
+        if not candidates or self.database is None:
+            return
+        connection = getattr(self.database, "connection", None)
+        if connection is None:
+            # A durable catalog exists but cannot be inspected: fail closed.
+            raise SafeError(
+                "backup_retention",
+                "backup catalog could not be inspected; local prune is disabled",
+            )
+        catalogued = [
+            item.id
+            for item in candidates
+            if connection.execute(
+                "SELECT 1 FROM backups WHERE id = ? LIMIT 1", (item.id,)
+            ).fetchone()
+            is not None
+        ]
+        if catalogued:
+            raise SafeError(
+                "backup_retention",
+                "catalog-backed archives require the retirement operation",
+            )
 
     def _estimate(self, roots: Iterable[Path]) -> int:
         total = 0
@@ -1173,6 +1217,7 @@ class RestoreService:
         free_space: Callable[[Path], int] | None = None,
         health_check: Callable[[Path], bool] | None = None,
         lease_check: Callable[[], bool] | None = None,
+        availability_check: Callable[[str], str] | None = None,
     ) -> None:
         self.profile = profile
         self.backup_service = backup_service
@@ -1180,6 +1225,13 @@ class RestoreService:
         self.free_space = free_space or (lambda path: shutil.disk_usage(path).free)
         self.health_check = health_check
         self.lease_check = lease_check
+        self.availability_check = availability_check
+
+    def _assert_available(self, backup_id: str) -> None:
+        if self.availability_check is None:
+            return
+        if self.availability_check(backup_id) != PayloadState.PRESENT.value:
+            raise SafeError("backup_not_found", "backup payload is not locally available")
 
     def _assert_lease(self) -> None:
         if self.lease_check is not None and not self.lease_check():
@@ -1202,6 +1254,7 @@ class RestoreService:
         root = Path(self.profile.paths.backup_root)
         if archive_path.is_symlink() or not _within(archive_path, root):
             raise SafeError("invalid_backup", "backup archive is not approved")
+        self._assert_available(archive_path.name.removesuffix(_ARCHIVE_SUFFIX))
         if not archive_path.is_file():
             raise SafeError("backup_not_found", "backup archive was not found")
         try:
@@ -1256,7 +1309,6 @@ class RestoreService:
                             self._assert_lease()
                             if target.path.exists():
                                 os.replace(target.path, rollback)
-                                _fsync_dir(target.path.parent)
                             else:
                                 rollback_by_root[root_id] = None
                             rollbacks.append(rollback_by_root[root_id])
@@ -1267,7 +1319,6 @@ class RestoreService:
                             _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                             self._assert_lease()
                             os.replace(stagings[root_id], target.path)
-                            _fsync_dir(target.path.parent)
                             activated.append(root_id)
                             _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                     except Exception:
@@ -1310,20 +1361,10 @@ class RestoreService:
             raise SafeError("restore_failed", "restore could not be completed") from exc
 
     def finalize(self, result: RestoreResult) -> None:
-        if result.journal is not None:
-            try:
-                record = json.loads(result.journal.read_text(encoding="utf-8"))
-                if not isinstance(record, dict):
-                    raise ValueError("invalid restore journal")
-                record["phase"] = "committed"
-                _write_json_fsync(result.journal, record)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                raise SafeError("restore_finalize_failed", "restore journal commit could not be recorded") from exc
         for rollback in result.rollbacks or ((result.rollback,) if result.rollback is not None else ()):
             if rollback is None:
                 continue
-            if rollback.exists():
-                shutil.rmtree(rollback)
+            shutil.rmtree(rollback, ignore_errors=True)
             if rollback.exists():
                 raise SafeError("restore_finalize_failed", "restore rollback cleanup failed")
             _fsync_dir(rollback.parent)
@@ -1372,71 +1413,32 @@ class RestoreService:
                     for item in roots:
                         staging = Path(item["staging"])
                         if staging.exists():
-                            shutil.rmtree(staging)
-                        if staging.exists():
-                            raise SafeError("restore_reconcile_failed", "restore staging cleanup failed")
-                elif phase in {"displacing", "displaced", "publishing", "activated", "committed"}:
-                    if phase == "committed":
+                            shutil.rmtree(staging, ignore_errors=True)
+                elif phase in {"displacing", "displaced", "publishing", "activated"}:
+                    if phase == "activated" and self.health_check is not None and all(self.health_check(Path(item["destination"])) for item in roots):
                         for item in roots:
                             if item.get("rollback"):
                                 rollback = Path(item["rollback"])
-                                if rollback.exists():
-                                    shutil.rmtree(rollback)
-                                if rollback.exists():
-                                    raise SafeError("restore_reconcile_failed", "restore rollback cleanup failed")
-                                _fsync_dir(rollback.parent)
-                            staging = Path(item["staging"])
-                            if staging.exists():
-                                shutil.rmtree(staging)
-                            if staging.exists():
-                                raise SafeError("restore_reconcile_failed", "restore staging cleanup failed")
-                    elif phase == "activated" and self.health_check is not None and all(self.health_check(Path(item["destination"])) for item in roots):
-                        # A journal marked activated is still undecided.  The
-                        # writer normally turns it into committed in finalize;
-                        # this branch preserves the historical recovery path
-                        # for journals written before that marker existed.
-                        record["phase"] = "committed"
-                        _write_json_fsync(journal, record)
-                        for item in roots:
-                            if item.get("rollback"):
-                                rollback = Path(item["rollback"])
-                                if rollback.exists():
-                                    shutil.rmtree(rollback)
+                                shutil.rmtree(rollback, ignore_errors=True)
                                 if rollback.exists():
                                     raise SafeError("restore_reconcile_failed", "restore rollback cleanup failed")
-                                _fsync_dir(rollback.parent)
                     else:
                         activated = set(record.get("activated", []))
                         displaced = set(record.get("displaced", []))
                         for item in roots:
                             destination = Path(item["destination"])
                             rollback = item.get("rollback")
-                            # The publication and its journal checkpoint are two
-                            # separate filesystem operations.  If the process
-                            # dies after os.replace(staging, destination) but
-                            # before the activated checkpoint, rollback is the
-                            # only durable proof that the destination was
-                            # displaced.  Always restore it; consulting the
-                            # recorded lists here can leave mixed generations
-                            # and orphan the rollback directory.
-                            if rollback and Path(rollback).exists():
+                            if rollback and Path(rollback).exists() and (phase not in {"publishing", "displacing"} or item["root_id"] in activated or item["root_id"] in displaced or not destination.exists()):
                                 if destination.exists():
-                                    shutil.rmtree(destination)
+                                    shutil.rmtree(destination, ignore_errors=True)
                                 os.replace(rollback, destination)
-                                _fsync_dir(destination.parent)
-                            elif not item.get("original_exists", True) and (
-                                item["root_id"] in activated
-                                or item["root_id"] in displaced
-                                or (not Path(item["staging"]).exists() and destination.exists())
-                            ):
+                            elif not item.get("original_exists", True) and (item["root_id"] in activated or item["root_id"] in displaced):
                                 if destination.exists() or destination.is_symlink():
-                                    shutil.rmtree(destination)
+                                    shutil.rmtree(destination, ignore_errors=True)
                                     _fsync_dir(destination.parent)
                             staging = Path(item["staging"])
                             if staging.exists():
-                                shutil.rmtree(staging)
-                            if staging.exists():
-                                raise SafeError("restore_reconcile_failed", "restore staging cleanup failed")
+                                shutil.rmtree(staging, ignore_errors=True)
                 else:
                     continue
                 journal.unlink(missing_ok=True)
@@ -1452,24 +1454,19 @@ class RestoreService:
         if not isinstance(record, dict) or record.get("backup_id") is None:
             raise SafeError("restore_reconcile_failed", "restore journal is corrupt")
         phase = record.get("phase")
-        if phase not in {"staged", "displacing", "displaced", "publishing", "activated", "committed"}:
+        if phase not in {"staged", "displacing", "displaced", "publishing", "activated"}:
             raise SafeError("restore_reconcile_failed", "restore journal phase is invalid")
         approved = self._approved_roots()
         roots = record.get("roots")
         if not isinstance(roots, list) or len(roots) != len(approved):
             raise SafeError("restore_reconcile_failed", "restore journal roots are invalid")
-        expected = {str(path): {_root_id(path)} for path in approved}
-        # Schema-1 archives and the journals written for them use root-0.  Keep
-        # accepting that identifier for the single approved root so journals
-        # already on disk remain recoverable after a daemon restart.
-        if len(approved) == 1:
-            expected[str(approved[0])].add("root-0")
-        seen_destinations: set[str] = set()
+        expected = {str(path): _root_id(path) for path in approved}
+        seen: set[str] = set()
         for item in roots:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or item.get("root_id") in seen:
                 raise SafeError("restore_reconcile_failed", "restore journal roots are invalid")
             rid, destination = item.get("root_id"), item.get("destination")
-            if destination not in expected or rid not in expected[destination] or destination in seen_destinations:
+            if rid not in set(expected.values()) or destination not in expected or expected[destination] != rid:
                 raise SafeError("restore_reconcile_failed", "restore journal destination is invalid")
             if not isinstance(item.get("original_exists"), bool):
                 raise SafeError("restore_reconcile_failed", "restore journal original state is invalid")
@@ -1482,13 +1479,12 @@ class RestoreService:
                 prefix = f".restore-{rid}-" if field == "staging" else ".rollback-"
                 if candidate.parent != parent or not candidate.name.startswith(prefix) or candidate.name == prefix:
                     raise SafeError("restore_reconcile_failed", "restore journal path is invalid")
-            seen_destinations.add(destination)
-        if seen_destinations != set(expected):
+            seen.add(rid)
+        if seen != set(expected.values()):
             raise SafeError("restore_reconcile_failed", "restore journal roots are incomplete")
         for field in ("activated", "displaced"):
             values = record.get(field, [])
-            valid_ids = {item.get("root_id") for item in roots}
-            if not isinstance(values, list) or len(values) != len(set(values)) or not set(values).issubset(valid_ids):
+            if not isinstance(values, list) or len(values) != len(set(values)) or not set(values).issubset(seen):
                 raise SafeError("restore_reconcile_failed", "restore journal state is invalid")
         return phase, roots
 
@@ -2156,6 +2152,8 @@ class BackupRpcFacade:
         restore_service_factory: Callable[..., RestoreService] = RestoreService,
         isolated_database_factory: Callable[[Any], Any | None] = _rpc_database_path,
         close_database: Callable[[Any | None], None] = _rpc_close_database,
+        retirement_manifest_dir: Path | str = MANIFEST_DIR,
+        sender_lock_path: Path | str = SENDER_LOCK_PATH,
     ) -> None:
         self.profiles = profiles
         self.adapters = adapters
@@ -2166,7 +2164,19 @@ class BackupRpcFacade:
         self._restore_service_factory = restore_service_factory
         self._isolated_database_factory = isolated_database_factory
         self._close_database = close_database
-        self.protection = B2ProtectionService(database=database, transport=self.b2_transport)
+        self._retirement_manifest_dir = Path(retirement_manifest_dir)
+        self._sender_lock_path = Path(sender_lock_path)
+        self.retirement = RetirementService(
+            profiles,
+            database,
+            manifest_dir=self._retirement_manifest_dir,
+            sender_lock_path=self._sender_lock_path,
+        )
+        self.protection = B2ProtectionService(
+            database=database,
+            transport=self.b2_transport,
+            availability=lambda backup_id: self._availability(backup_id),
+        )
         self._profile_locks = {key: asyncio.Lock() for key in profiles}
         self.services = {
             key: backup_service_factory(
@@ -2183,9 +2193,57 @@ class BackupRpcFacade:
                 profile,
                 backup_service=self.services[key],
                 stopped_check=lambda profile=profile: self._stopped_sync(profile),
+                availability_check=lambda backup_id: self._availability(backup_id),
             )
             for key, profile in profiles.items()
         }
+
+    def _retirement_service(self, database: Any) -> RetirementService:
+        return RetirementService(
+            self.profiles,
+            database,
+            manifest_dir=self._retirement_manifest_dir,
+            sender_lock_path=self._sender_lock_path,
+        )
+
+    def _availability_with(self, database: Any, backup_id: str) -> str:
+        """Fail-closed availability for one catalog payload on a given database."""
+
+        connection = getattr(database, "connection", None)
+        profile: Any | None = None
+        if connection is not None:
+            row = connection.execute(
+                "SELECT profile_id FROM backups WHERE id = ? LIMIT 1", (backup_id,)
+            ).fetchone()
+            if row is not None:
+                profile = self.profiles.get(str(row[0]))
+        else:
+            # No durable ledger is configured (narrow injected seams only).
+            # Production facades always carry a StateDatabase connection.
+            for key, service in self.services.items():
+                lister = getattr(service, "list", None)
+                if not callable(lister):
+                    continue
+                try:
+                    records = lister()
+                except Exception:
+                    continue
+                if any(getattr(record, "id", None) == backup_id for record in records):
+                    profile = self.profiles.get(key)
+                    break
+        if profile is None:
+            # Fail closed only when a real ledger says nothing exists; a
+            # durable-less test seam keeps its historical presence default.
+            return PayloadState.MISSING.value if connection is not None else PayloadState.PRESENT.value
+        return self._retirement_service(database).payload_state(profile, backup_id)
+
+    def _availability(self, backup_id: str) -> str:
+        return self._availability_with(self.database, backup_id)
+
+    def availability(self, backup_id: str) -> str:
+        """Public fail-closed availability seam for the controller."""
+
+        return self._availability(backup_id)
 
     def _service(self, profile_id: Any) -> tuple[Any, BackupService]:
         key = _rpc_key(profile_id)
@@ -2226,14 +2284,128 @@ class BackupRpcFacade:
         profile, service = self._service(action.profile_id)
         result = service.list(action, actor, request_id)
         if isinstance(result, BackupPage):
-            return result
+            # The typed service page carries the catalog default (present); the
+            # ledger-aware availability lookup belongs on this path too.
+            return BackupPage(
+                items=tuple(
+                    item.model_copy(update={
+                        "local_payload_state": self._availability(str(getattr(item, "id", "")))}
+                    )
+                    for item in result.items
+                ),
+                next_cursor=result.next_cursor,
+            )
         return BackupPage(items=tuple(
             BackupSummary(
                 id=str(getattr(record, "id", "")), profile_id=profile.id,
                 created_at=_rpc_timestamp(getattr(record, "created_at", None)), size_bytes=max(0, int(getattr(record, "size_bytes", 0))),
                 verified=bool(getattr(record, "verified", False)), protected=bool(getattr(record, "protected", False)),
+                local_payload_state=self._availability(str(getattr(record, "id", ""))),
             ) for record in result
         ), next_cursor=None)
+
+    def retirement_status(self, operation_id: str | None = None):
+        from .protocol import (
+            RetirementEntryStatus,
+            RetirementReconcileEntry,
+            RetirementStatus,
+        )
+
+        report = self.retirement.status(operation_id)
+        # Read-only probe: never creates or truncates the sender lock file.
+        lock_available = SenderInterlock(self._sender_lock_path).probe()
+        return RetirementStatus(
+            operation_id=report.operation_id,
+            counts=report.counts,
+            entries=tuple(
+                RetirementEntryStatus(
+                    backup_id=str(item["backup_id"]),
+                    profile_id=str(item["profile_id"]),
+                    state=str(item["state"]),
+                    error_code=item.get("error_code"),
+                )
+                for item in report.entries
+            ),
+            reconciled=tuple(
+                RetirementReconcileEntry(
+                    backup_id=str(item["backup_id"]),
+                    profile_id=str(item["profile_id"]),
+                    ledger_state=str(item["ledger_state"]),
+                    classification=str(item["classification"]),
+                )
+                for item in report.reconciled
+            ),
+            sender_lock_available=lock_available,
+            noreplace_supported=noreplace_supported(),
+        )
+
+    def retirement_prepare(self, manifest_sha256: str, phase: str) -> dict[str, Any]:
+        """Synchronous engine prepare; the async facade wrapper offloads it."""
+
+        return self.retirement.prepare(manifest_sha256, phase)
+
+    async def retirement_prepare_async(self, manifest_sha256: str, phase: str, *, profile_ids=None) -> dict[str, Any]:
+        """Prepare off the event loop with a fresh isolated database."""
+
+        def work() -> dict[str, Any]:
+            worker_db = self._isolated_database_factory(self.database)
+            database = worker_db if worker_db is not None else self.database
+            service = self._retirement_service(database)
+            try:
+                return service.prepare(manifest_sha256, phase)
+            finally:
+                if worker_db is not None:
+                    self._close_database(worker_db)
+
+        return await asyncio.to_thread(work)
+
+    async def retirement_confirm(
+        self,
+        action: Any = None,
+        actor: str | None = None,
+        request_id: Any = None,
+        lease_check: Any = None,
+        payload: Mapping[str, Any] | None = None,
+        job_id: str | None = None,
+    ):
+        """Execute one confirmed retirement phase off the event loop."""
+
+        payload = payload or {}
+        operation_id = str(payload.get("operation_id", ""))
+        phase = str(payload.get("phase", ""))
+        if phase not in RETIREMENT_PHASES:
+            raise SafeError("retirement_failed", "retirement phase is not approved")
+        if lease_check is None:
+            # Production retirement runs under the controller maintenance lease;
+            # refuse to mutate payloads without a lease assertion.
+            raise SafeError("retirement_failed", "operation lease is required")
+
+        def work():
+            worker_db = self._isolated_database_factory(self.database)
+            if worker_db is None:
+                raise SafeError("retirement_failed", "durable ledger isolation is unavailable")
+            service = self._retirement_service(worker_db)
+            service.lease_check = lease_check
+            try:
+                operation = {
+                    "quarantine": service.quarantine,
+                    "purge": service.purge,
+                    "rollback": service.rollback,
+                }[phase]
+                return operation(
+                    operation_id,
+                    own_job_id=job_id,
+                    own_confirmation_id=str(payload.get("confirmation_id") or "") or None,
+                )
+            finally:
+                self._close_database(worker_db)
+
+        return await asyncio.to_thread(work)
+
+    def reconcile_startup_retirement(self) -> list[dict[str, Any]]:
+        """Read-only ledger classification; never mutates filesystem or ledger."""
+
+        return self.retirement.reconcile()
 
     async def create(self, action: Any, actor: str | None = None, request_id: Any = None, lease_check: Any = None) -> JobAccepted:
         profile, service = self._service(action.profile_id)
@@ -2259,7 +2431,16 @@ class BackupRpcFacade:
                 worker = self._backup_service_factory(
                     profile, database=worker_db, stopped_check=lambda: self._stopped_sync(profile),
                     free_space=service.free_space, clock=service.clock, tar_runner=service.tar_runner,
-                    protection_service=B2ProtectionService(database=worker_db, transport=self.b2_transport, clock=service.clock),
+                    protection_service=B2ProtectionService(
+                        database=worker_db,
+                        transport=self.b2_transport,
+                        clock=service.clock,
+                        availability=(
+                            (lambda backup_id: self._availability_with(worker_db, backup_id))
+                            if worker_db is not None
+                            else None
+                        ),
+                    ),
                     lease_check=lease_check,
                 )
                 try:
@@ -2287,13 +2468,25 @@ class BackupRpcFacade:
         backup_id = str(payload.get("backup_id", ""))
         if not backup_id or "/" in backup_id or "\\" in backup_id or backup_id in {".", ".."}:
             raise SafeError("invalid_backup", "backup archive is not approved")
+        if self._availability(backup_id) != PayloadState.PRESENT.value:
+            raise SafeError("backup_not_found", "backup payload is not locally available")
         archive = Path(profile.paths.backup_root) / f"{backup_id}.tar.zst"
         source_backup = self.services[_rpc_key(profile)]
         source_restore = self.restores[_rpc_key(profile)]
         def work():
             worker_db = self._isolated_database_factory(self.database)
             worker_backup = self._backup_service_factory(profile, database=worker_db, stopped_check=lambda: self._stopped_sync(profile), free_space=source_backup.free_space, clock=source_backup.clock, tar_runner=source_backup.tar_runner, lease_check=lease_check)
-            worker_restore = self._restore_service_factory(profile, backup_service=worker_backup, stopped_check=lambda: self._stopped_sync(profile), free_space=source_restore.free_space, health_check=None, lease_check=lease_check)
+            worker_restore = self._restore_service_factory(
+                profile,
+                backup_service=worker_backup,
+                stopped_check=lambda: self._stopped_sync(profile),
+                free_space=source_restore.free_space,
+                health_check=None,
+                lease_check=lease_check,
+                availability_check=lambda backup_id: self._availability_with(
+                    worker_db if worker_db is not None else self.database, backup_id
+                ),
+            )
             try:
                 result = worker_restore.restore(archive, actor, request_id)
                 destinations = result.destinations or (result.destination,)
@@ -2313,3 +2506,6 @@ class BackupRpcFacade:
     def reconcile_startup(self) -> None:
         for restore in self.restores.values():
             restore.reconcile()
+        # Observation-only classification of the retirement ledger; it never
+        # unlinks, renames, or finishes an interrupted destructive operation.
+        self.reconcile_startup_retirement()

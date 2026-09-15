@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -71,6 +72,10 @@ from .protocol import (
     ListBackups,
     ListAggregateBackups,
     ListEvents,
+    GetRetirementStatus,
+    PrepareRetirement,
+    ConfirmRetirement,
+    RetirementConfirmation,
     LogPage,
     NotificationConfig,
     PrepareForceStop,
@@ -93,6 +98,7 @@ from .protocol import (
     RpcSuccess,
     SafeDetails,
     Start,
+    StartupEstimate,
     StatusSnapshot,
     ProfileConfigEntry,
     ProfileConfigResponse,
@@ -117,8 +123,19 @@ from .perf import PerformanceTracker
 from .db_telemetry import collect_perf_databases_async
 from .introspection import signature_parameters
 from .runtime.protocols import AlertObservation
+from .startup_estimates import (
+    StartupAttempt,
+    StartupEstimateStore,
+    StartupEstimateSummary,
+    installed_version_for_profile,
+    normalize_profile_key,
+)
 
 _LOG = logging.getLogger(__name__)
+
+# Bounded wait for the reviewed version-file read; a slow or hostile path only
+# loses the estimate hint.
+_STARTUP_VERSION_HINT_TIMEOUT_SECONDS = 2.0
 
 
 DISPATCH: dict[type, str] = {
@@ -158,6 +175,9 @@ DISPATCH: dict[type, str] = {
     PrepareUpdate: "_prepare_update",
     ConfirmUpdate: "_confirm_update",
     GetNotificationConfig: "_get_notification_config",
+    GetRetirementStatus: "_get_retirement_status",
+    PrepareRetirement: "_prepare_retirement",
+    ConfirmRetirement: "_confirm_retirement",
     Command: "_command",
     # Notification implementations belong to later tasks; these are typed
     # seams and deliberately have no arbitrary service dispatch.
@@ -221,6 +241,9 @@ ACTION_CLASSES: dict[type, _ActionClass] = {
     SetNotificationRule: _ActionClass.MUTATION,
     TestNotification: _ActionClass.MUTATION,
     SetIdleStop: _ActionClass.MUTATION,
+    GetRetirementStatus: _ActionClass.PURE_READ,
+    PrepareRetirement: _ActionClass.MUTATION,
+    ConfirmRetirement: _ActionClass.MUTATION,
     Command: _ActionClass.MUTATION,
 }
 
@@ -333,6 +356,15 @@ class Controller:
         self._background_close_task: asyncio.Task[None] | None = None
         self._background_closed = False
         self._readiness = ReadinessCoordinator()
+        # Experimental startup estimates are controller-owned and boundary
+        # safe: a missing history or additive table degrades to "no estimate"
+        # and never changes lifecycle or slot authority.
+        self._startup_estimates = StartupEstimateStore(self._db)
+        self._startup_attempts: dict[str, StartupAttempt] = {}
+        try:
+            self._startup_estimates.ensure_schema()
+        except Exception:
+            _LOG.debug("startup estimate schema unavailable", exc_info=True)
 
     @staticmethod
     def _consume_background_task(task: asyncio.Task[Any]) -> None:
@@ -439,6 +471,129 @@ class Controller:
                 ))
             except Exception:
                 _LOG.debug("wake alert evaluation dropped", exc_info=True)
+
+    def _begin_startup_attempt(self, profile_id: Any, version: str | None = None) -> StartupAttempt:
+        """Register one genuine start attempt for status projection and training."""
+
+        attempt = StartupAttempt(attempt_id=uuid4().hex, started=time.monotonic(), version=version)
+        key = normalize_profile_key(profile_id)
+        if key is not None:
+            self._startup_attempts[key] = attempt
+        return attempt
+
+    def _end_startup_attempt(self, profile_id: Any, attempt: StartupAttempt | None) -> None:
+        key = normalize_profile_key(profile_id)
+        if key is None or attempt is None:
+            return
+        if self._startup_attempts.get(key) is attempt:
+            del self._startup_attempts[key]
+
+    async def _installed_version_hint(self, profile: Profile) -> str | None:
+        """Best-effort installed version from bounded reviewed metadata.
+
+        A cached status projection may predate a just-applied modpack update, so
+        only freshly read, size-bounded profile metadata is trusted.  Any
+        failure returns ``None`` and never delays or fails the lifecycle.
+        """
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(installed_version_for_profile, profile),
+                timeout=_STARTUP_VERSION_HINT_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            _LOG.debug("installed version hint unavailable", exc_info=True)
+            return None
+
+    async def _record_startup_estimate(
+        self,
+        profile_id: Any,
+        attempt: StartupAttempt | None,
+        *,
+        success: bool,
+    ) -> None:
+        """Train only on a genuine successful start with a known version.
+
+        The elapsed window is snapshotted before the state transaction so lock
+        or write latency never inflates a sample, and the write shares the
+        controller's state-database ownership rather than committing on its own.
+        """
+
+        if attempt is None or not success:
+            return
+        version = attempt.version
+        if not version:
+            return
+        duration_ms = (time.monotonic() - attempt.started) * 1000.0
+        stamp = _iso(self._clock())
+
+        def write() -> None:
+            try:
+                self._startup_estimates.record_sample(
+                    profile_id,
+                    version,
+                    duration_ms,
+                    run_key=attempt.attempt_id,
+                    finished_at=stamp,
+                    managed_transaction=True,
+                )
+            except Exception:
+                _LOG.debug("startup estimate sample dropped", exc_info=True)
+
+        try:
+            await self._transaction(write)
+        except Exception:
+            _LOG.debug("startup estimate transaction unavailable", exc_info=True)
+
+    def _startup_estimate_for(self, status: Any) -> StartupEstimate | None:
+        """Project the bounded history plus any in-flight attempt for one profile."""
+
+        key = normalize_profile_key(getattr(status, "profile_id", None))
+        attempt = self._startup_attempts.get(key) if key is not None else None
+        state = getattr(status, "state", None)
+        starting = getattr(state, "value", state) == "starting"
+        if attempt is None and not starting:
+            return None
+        # Bind the bucket to the attempt's own version: an in-flight attempt
+        # with unknown or new version metadata must never read a cached old
+        # version's history.
+        version = attempt.version if attempt is not None else getattr(status, "installed_version", None)
+        summary = StartupEstimateSummary()
+        if isinstance(version, str) and version.strip():
+            summary = self._startup_estimates.summary(status.profile_id, version)
+        if attempt is None and summary.sample_count == 0:
+            return None
+        median = summary.median_seconds
+        if median is not None and (not math.isfinite(median) or median <= 0.0 or median > 900.0):
+            median = None
+        elapsed = None if attempt is None else attempt.elapsed_seconds()
+        if elapsed is not None and (not math.isfinite(elapsed) or elapsed < 0.0 or elapsed > 86400.0):
+            elapsed = None
+        return StartupEstimate(
+            sample_count=max(0, min(25, int(summary.sample_count))),
+            median_seconds=median,
+            attempt_id=None if attempt is None else attempt.attempt_id,
+            elapsed_seconds=elapsed,
+            version=version if isinstance(version, str) and version.strip() else None,
+        )
+
+    def _with_startup_estimates(self, snapshot: StatusSnapshot) -> StatusSnapshot:
+        """Overlay the estimate projection without disturbing other fields."""
+
+        try:
+            profiles = []
+            changed = False
+            for status in snapshot.profiles:
+                estimate = self._startup_estimate_for(status)
+                if estimate == status.startup_estimate:
+                    profiles.append(status)
+                    continue
+                profiles.append(status.model_copy(update={"startup_estimate": estimate}))
+                changed = True
+            return snapshot if not changed else snapshot.model_copy(update={"profiles": tuple(profiles)})
+        except Exception:
+            _LOG.debug("startup estimate projection unavailable", exc_info=True)
+            return snapshot
 
     @classmethod
     def for_testing(cls, tmp_path: Path) -> "Controller":
@@ -682,6 +837,10 @@ class Controller:
         if isinstance(action, dict) and action.get("kind") == "command":
             command = action.pop("command", "")
             action["command_digest"] = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        if isinstance(action, dict) and action.get("kind") == "create_backup":
+            # The capability is a transport authorization token, not part of
+            # the durable backup request identity.
+            action.pop("reservation_capability", None)
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     async def _claim_request(self, request_id: UUID, canonical: str) -> RpcResponse | _PendingReplay | None:
@@ -941,7 +1100,20 @@ class Controller:
 
     async def _await_lease(self, awaitable, renewal_task, *, drain_on_renewal: bool = False):
         if renewal_task is None:
-            return await awaitable
+            # No renewable reservation is owned by this process (a handoff runs
+            # under another process's live update reservation).  Cancelling a
+            # coroutine that awaits ``asyncio.to_thread`` does not stop the
+            # worker thread, so drain the work before the caller's cleanup can
+            # run and release anything the worker still depends on.
+            work = asyncio.ensure_future(awaitable)
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(work)
+                except BaseException:
+                    pass
+                raise
         work = asyncio.create_task(awaitable)
         try:
             done, _ = await asyncio.wait((work, renewal_task), return_when=asyncio.FIRST_COMPLETED)
@@ -1054,6 +1226,7 @@ class Controller:
         job_id = None
         readiness_ticket = None
         start_attempted_by_request = False
+        startup_attempt: StartupAttempt | None = None
         try:
             lease = await self._reserve(profile, "start", str(request_id), actor=actor)
             renewal_task = self._lease_renewal(lease)
@@ -1066,6 +1239,11 @@ class Controller:
             # contender must never replace the genuine start's wait target.
             readiness_ticket = self._readiness.begin(profile.id)
             start_attempted_by_request = True
+            # Measure the genuine attempt from the adapter start, not from the
+            # accepted request or the slot wait, so wait time never trains.
+            startup_attempt = self._begin_startup_attempt(
+                profile.id, await self._installed_version_hint(profile)
+            )
             await self._await_lease(self._adapter(profile).start(profile), renewal_task)
             await self._assert_lease(renewal_task)
             ready = await self._probe_start_health(profile, renewal_task)
@@ -1073,6 +1251,7 @@ class Controller:
                 raise RuntimeError("start readiness failed")
             await self._transaction(lambda: self._finish(job_id, actor, "start", profile.id, ok=True))
             lifecycle_success = True
+            await self._record_startup_estimate(profile.id, startup_attempt, success=True)
             self._readiness.notify(readiness_ticket, ReadinessOutcome.SUCCESS)
             return JobAccepted(
                 job_id=job_id,
@@ -1101,6 +1280,7 @@ class Controller:
         finally:
             if readiness_ticket is not None:
                 self._readiness.finish(readiness_ticket)
+            self._end_startup_attempt(profile.id, startup_attempt)
             self._record_lifecycle_latency("wake_duration", profile.id, lifecycle_started, success=lifecycle_success)
             await self._release_lease(lease, renewal_task)
 
@@ -1453,6 +1633,7 @@ class Controller:
         renewal_task = None
         lease = None
         target_started = False
+        target_attempt: StartupAttempt | None = None
         rollback_lease = None
         rollback_task = None
         lifecycle_started = time.monotonic()
@@ -1490,6 +1671,9 @@ class Controller:
                 )
                 await self._assert_lease(renewal_task)
             target_started = True
+            target_attempt = self._begin_startup_attempt(
+                target, await self._installed_version_hint(target_profile)
+            )
             await self._start_with_free_retry(target_profile, renewal_task)
             await self._assert_lease(renewal_task)
             ready = await self._probe_start_health(target_profile, renewal_task)
@@ -1497,6 +1681,7 @@ class Controller:
                 raise RuntimeError("target readiness failed")
             await self._transaction(lambda: self._finish(job_id, actor, "switch", target, ok=True))
             lifecycle_success = True
+            await self._record_startup_estimate(target, target_attempt, success=True)
             return JobAccepted(job_id=job_id, state="running")
         except Exception as exc:
             if payload.get("rollback_on_failure", True):
@@ -1560,6 +1745,7 @@ class Controller:
             await self._transaction(lambda: self._finish(job_id, actor, "switch", target, ok=False, code=code, detail=detail))
             raise _ControllerFailure(code, detail) from exc
         finally:
+            self._end_startup_attempt(target, target_attempt)
             self._record_lifecycle_latency("switch_duration", target, lifecycle_started, success=lifecycle_success)
             await self._release_lease(lease, renewal_task)
             await self._release_lease(rollback_lease, rollback_task)
@@ -1687,6 +1873,7 @@ class Controller:
         else:
             result = StatusSnapshot(generation=0, observed_at=self._clock(), profiles=())
         if isinstance(result, StatusSnapshot):
+            result = self._with_startup_estimates(result)
             result = result.model_copy(update={"initializing": self.initializing})
             return result
         return result
@@ -2048,7 +2235,8 @@ class Controller:
     async def _list_aggregate_backups(self, action: ListAggregateBackups, actor: str, request_id: UUID) -> BackupPage:
         items = []
         per_profile = min(200, action.page.limit)
-        for profile_id in sorted(self.profiles, key=lambda item: item.value):
+        profile_ids = (getattr(profile, "id", profile) for profile in self.profiles)
+        for profile_id in sorted(profile_ids, key=lambda item: getattr(item, "value", item)):
             page = await self._list_backups(
                 ListBackups(kind="list_backups", profile_id=profile_id,
                             page=PageOptions(limit=per_profile)),
@@ -2382,9 +2570,6 @@ class Controller:
                 baseline_preset=entry.baseline_preset,
                 candidate_preset=entry.candidate_preset,
                 campaign=entry.campaign,
-                maintenance_window=entry.maintenance_window,
-                rollback_safe=entry.rollback_safe,
-                public_wake_policy=entry.public_wake_policy,
             )
             for entry in self._schedule.entries
         ))
@@ -2435,31 +2620,79 @@ class Controller:
     ) -> JobAccepted:
         """Run one synchronous maintenance worker under a durable controller job."""
         async with self._operation_lease(profile, operation, request_id, actor=actor) as (lease, renewal):
-            job_id = await self._transaction(lambda: self._job_intent(actor, operation, profile.id))
+            return await self._run_bound_maintenance_job(
+                profile, operation, action, actor, request_id, service,
+                lease_check=lambda: self._lease_owned_sync(lease),
+                renewal=renewal,
+                **extra,
+            )
+
+    async def _run_handoff_maintenance_job(
+        self, profile: Profile, operation: str, action: Any, actor: str, request_id: UUID,
+        service: Any, *, capability: str, handoff: Any, **extra: Any,
+    ) -> JobAccepted:
+        """Run one job under an exact live update reservation, without reacquiring it."""
+        def lease_check() -> bool:
+            store = self.reservation_store
+            authorize = getattr(store, "authorize_handoff", None)
+            if not callable(authorize):
+                return False
             try:
-                await self._await_lease(
-                    self._invoke(service, action, actor, request_id,
-                                 lease_check=lambda: self._lease_owned_sync(lease), **extra),
-                    renewal,
-                    drain_on_renewal=True,
-                )
-            except asyncio.CancelledError:
-                await self._transaction(lambda: self._finish(
-                    job_id, actor, operation, profile.id, ok=False,
-                    code=ErrorCode.INTERNAL_ERROR, detail="maintenance cancelled",
-                ))
-                raise
-            except Exception as exc:
-                failure = self._maintenance_failure(operation, exc)
-                await self._transaction(lambda: self._finish(
-                    job_id, actor, operation, profile.id, ok=False,
-                    code=failure.code, detail=failure.message,
-                ))
-                raise failure from exc
+                current = authorize(profile.id, capability, operation_kind="update")
+            except Exception:
+                return False
+            return (
+                current.profile_id == handoff.profile_id
+                and current.operation_id == handoff.operation_id
+                and current.state_generation == handoff.state_generation
+                and current.controller_pid == handoff.controller_pid
+                and current.controller_start_ticks == handoff.controller_start_ticks
+            )
+
+        if not lease_check():
+            raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "update handoff is unavailable")
+        return await self._run_bound_maintenance_job(
+            profile, operation, action, actor, request_id, service,
+            lease_check=lease_check,
+            renewal=None,
+            return_service_result=True,
+            **extra,
+        )
+
+    async def _run_bound_maintenance_job(
+        self, profile: Profile, operation: str, action: Any, actor: str, request_id: UUID,
+        service: Any, *, lease_check: Callable[[], bool], renewal: asyncio.Task | None,
+        return_service_result: bool = False,
+        **extra: Any,
+    ) -> JobAccepted:
+        job_id = await self._transaction(lambda: self._job_intent(actor, operation, profile.id))
+        try:
+            result = await self._await_lease(
+                self._invoke(service, action, actor, request_id,
+                             lease_check=lease_check,
+                             job_id=job_id, **extra),
+                renewal,
+                drain_on_renewal=True,
+            )
+        except asyncio.CancelledError:
             await self._transaction(lambda: self._finish(
-                job_id, actor, operation, profile.id, ok=True, detail=f"{operation} completed",
+                job_id, actor, operation, profile.id, ok=False,
+                code=ErrorCode.INTERNAL_ERROR, detail="maintenance cancelled",
             ))
-            return JobAccepted(job_id=job_id, state="succeeded")
+            raise
+        except Exception as exc:
+            failure = self._maintenance_failure(operation, exc)
+            await self._transaction(lambda: self._finish(
+                job_id, actor, operation, profile.id, ok=False,
+                code=failure.code, detail=failure.message,
+            ))
+            raise failure from exc
+        await self._transaction(lambda: self._finish(
+            job_id, actor, operation, profile.id, ok=True, detail=f"{operation} completed",
+        ))
+        if return_service_result and isinstance(result, JobAccepted):
+            return result
+        return JobAccepted(job_id=job_id, state="succeeded")
 
     @staticmethod
     def _maintenance_failure(operation: str, exc: Exception) -> _ControllerFailure:
@@ -2470,6 +2703,7 @@ class Controller:
             "restore": ErrorCode.RESTORE_FAILED,
             "update": ErrorCode.UPDATE_FAILED,
             "world_clone": ErrorCode.INVALID_REQUEST,
+            "retirement": ErrorCode.RETIREMENT_FAILED,
         }
         if isinstance(exc, SafeError):
             try:
@@ -2481,6 +2715,12 @@ class Controller:
                 "restore": {ErrorCode.RESTORE_FAILED, ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
                 "update": {ErrorCode.UPDATE_FAILED, ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
                 "world_clone": {ErrorCode.INVALID_REQUEST, ErrorCode.SLOT_CONFLICT},
+                "retirement": {
+                    ErrorCode.RETIREMENT_FAILED,
+                    ErrorCode.RETIREMENT_UNAVAILABLE,
+                    ErrorCode.INVALID_REQUEST,
+                    ErrorCode.SLOT_CONFLICT,
+                },
             }
             if code not in allowed.get(operation, set()):
                 code = defaults.get(operation, ErrorCode.INTERNAL_ERROR)
@@ -2493,11 +2733,37 @@ class Controller:
         service = self._service("backups", "create")
         if service is None:
             raise _ControllerFailure(ErrorCode.BACKUP_FAILED, "backup service unavailable")
+        if action.reservation_capability is not None:
+            if (
+                profile.id != ProfileId.MINECRAFT_SUNLIT_COBBLEMON
+                or not action.protected
+                or action.destination is not BackupDestination.HORIZON_B2
+            ):
+                raise _ControllerFailure(ErrorCode.INVALID_REQUEST, "reservation handoff is not permitted")
+            authorize = getattr(self.reservation_store, "authorize_handoff", None)
+            if not callable(authorize):
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "update handoff is unavailable")
+            try:
+                handoff = authorize(
+                    profile.id,
+                    action.reservation_capability,
+                    operation_kind="update",
+                )
+            except (BlockingIOError, OSError, ValueError, PermissionError) as exc:
+                raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "update handoff is unavailable") from exc
+            return await self._run_handoff_maintenance_job(
+                profile, "backup", action, actor, request_id, service,
+                capability=action.reservation_capability,
+                handoff=handoff,
+            )
         return await self._run_maintenance_job(profile, "backup", action, actor, request_id, service)
 
     async def _prepare_restore(self, action: PrepareRestore, actor: str, request_id: UUID) -> ConfirmationSummary:
         profile = self._profile(action.profile_id)
         self._require_operation(profile, OperationName.RESTORE, actor)
+        availability = self._service("backups", "availability")
+        if availability is not None and availability(action.backup_id) != "present":
+            raise _ControllerFailure(ErrorCode.RESTORE_FAILED, "backup payload is not locally available")
         return await self._create_confirmation(
             actor,
             "restore",
@@ -2523,7 +2789,84 @@ class Controller:
             raise _ControllerFailure(ErrorCode.RESTORE_FAILED, "restore service unavailable")
         profile_id = payload.get("profile_id", getattr(action, "profile_id", None))
         profile = self._profile(profile_id)
+        availability = self._service("backups", "availability")
+        backup_id = str(payload.get("backup_id", ""))
+        if availability is not None and backup_id and availability(backup_id) != "present":
+            raise _ControllerFailure(ErrorCode.RESTORE_FAILED, "backup payload is not locally available")
         return await self._run_maintenance_job(profile, "restore", action, actor, request_id, service, payload=payload)
+
+    async def _get_retirement_status(self, action: GetRetirementStatus, actor: str, request_id: UUID):
+        service = self._service("backups", "retirement_status")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.RETIREMENT_FAILED, "retirement service unavailable")
+        result = service(action.operation_id)
+        return await result if inspect.isawaitable(result) else result
+
+    async def _prepare_retirement(self, action: PrepareRetirement, actor: str, request_id: UUID) -> ConfirmationSummary:
+        service = self._service("backups", "retirement_prepare_async")
+        if service is None:
+            service = self._service("backups", "retirement_prepare")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.RETIREMENT_FAILED, "retirement service unavailable")
+        summary = await self._invoke_prepare(service, action)
+        profile_ids = tuple(str(item) for item in summary.get("profile_ids", ()))
+        if not profile_ids:
+            raise _ControllerFailure(ErrorCode.RETIREMENT_FAILED, "retirement plan has no profiles")
+        for value in profile_ids:
+            self._require_operation(self._profile(ProfileId(value)), OperationName.RESTORE, actor)
+        profile_id = ProfileId(profile_ids[0])
+        scoped = {
+            "operation_id": action.operation_id,
+            "phase": action.phase,
+            "destination_id": str(summary["destination_id"]),
+            "count": int(summary["count"]),
+            "bytes": int(summary["bytes"]),
+            "profile_ids": list(profile_ids),
+        }
+        return await self._create_confirmation(
+            actor,
+            "retirement",
+            profile_id,
+            scoped,
+            lambda confirmation_id, expires, summary_hash, generation: RetirementConfirmation(
+                confirmation_id=confirmation_id,
+                expires_at=expires,
+                summary_hash=summary_hash,
+                state_generation=generation,
+                action="retirement",
+                operation_id=action.operation_id,
+                phase=action.phase,
+                destination_id=scoped["destination_id"],
+                count=scoped["count"],
+                bytes=scoped["bytes"],
+                profile_ids=profile_ids,
+            ),
+        )
+
+    async def _invoke_prepare(self, service: Any, action: PrepareRetirement) -> dict[str, Any]:
+        try:
+            names = tuple(parameter.name for parameter in signature_parameters(service))
+        except (TypeError, ValueError):
+            names = ()
+        if "manifest_sha256" in names:
+            result = service(action.operation_id, action.phase)
+        else:
+            result = service(action)
+        result = await result if inspect.isawaitable(result) else result
+        if not isinstance(result, dict):
+            raise _ControllerFailure(ErrorCode.RETIREMENT_FAILED, "retirement plan is unavailable")
+        return result
+
+    async def _confirm_retirement(self, action: ConfirmRetirement, actor: str, request_id: UUID) -> JobAccepted:
+        payload = await self._consume_confirmation(actor, "retirement", action.confirmation_id)
+        payload = {**payload, "confirmation_id": action.confirmation_id}
+        service = self._service("backups", "retirement_confirm")
+        if service is None:
+            raise _ControllerFailure(ErrorCode.RETIREMENT_FAILED, "retirement service unavailable")
+        profile = self._profile(ProfileId(str(payload.get("profile_id"))))
+        return await self._run_maintenance_job(
+            profile, "retirement", action, actor, request_id, service, payload=payload
+        )
 
     async def _prepare_world_clone(self, action: PrepareWorldClone, actor: str, request_id: UUID) -> ConfirmationSummary:
         source = self._profile(ProfileId.TERRARIA_VANILLA)

@@ -35,7 +35,6 @@ from .runtime.telemetry import TelemetryRuntime
 from .rcon import RCON_HOST, RCON_PASSWORD_PATH, RCON_PORT, RconClient, SunlitRconTransport
 from .rcon_telemetry import PersistentRconTelemetry
 from .schedule import parse_schedule
-from .schedule_config import ScheduleConfigError, load_schedule_entries
 from .protocol import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
@@ -288,12 +287,8 @@ class UnixRpcServer:
             if isinstance(payload, dict) and "generation" in payload
             else self.watch_hub.generation
         )
-        # The browser-facing SSE contract calls snapshots ``status``.  The
-        # controller action is named ``get_status`` internally; leaking that
-        # RPC name makes EventSource listeners ignore the authoritative frame.
-        event_kind = "status" if isinstance(result, StatusSnapshot) else kind
         await self.watch_hub.publish(
-            event_kind, payload, generation=generation, full=isinstance(result, StatusSnapshot)
+            kind, payload, generation=generation, full=isinstance(result, StatusSnapshot)
         )
 
     async def _watch_client(self, request, writer: asyncio.StreamWriter) -> None:
@@ -355,13 +350,12 @@ def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFI
     boot_autostart = config.get("boot_autostart", False)
     if not isinstance(boot_autostart, bool):
         raise RuntimeError("invalid boot autostart flag")
-    state_path = Path(config.get("state_db", STATE_DB_PATH))
-    schedule_override = state_path.with_name("schedules.toml")
     try:
-        schedules = parse_schedule(load_schedule_entries(config, schedule_override))
-    except (ScheduleConfigError, ValueError) as exc:
+        schedules = parse_schedule(config.get("schedule"))
+    except ValueError as exc:
         raise RuntimeError("invalid schedule configuration") from exc
     profiles_dir = Path(config.get("profiles_dir", config.get("profile_dir", PROFILES_DIR)))
+    state_path = Path(config.get("state_db", STATE_DB_PATH))
     reservation_path = Path(config.get("reservation_path", "/run/game-control/reservation.json"))
     registry = ProfileRegistry.load(profiles_dir)
     state_db = StateDatabase.open(state_path)
@@ -500,7 +494,7 @@ def _build_controller_unmanaged(config_path: str | os.PathLike[str] = ROOT_CONFI
         boot_profile=boot_profile,
         boot_autostart=boot_autostart,
         schedules=schedules,
-        schedule_config_path=schedule_override,
+        schedule_config_path=config_file,
     )
     if provisional is not None:
         provisional.register(controller, controller.aclose)

@@ -157,17 +157,11 @@ class PerformanceAlertEvaluator:
             if mspt is not None:
                 samples = self._mspt[profile_id]
                 samples.append((timestamp, mspt))
-                cutoff = timestamp - MSPT_SUSTAINED_SECONDS
-                # Retain the last observation before the window boundary.  A
-                # fractional polling interval otherwise removes the only
-                # sample that can prove the breach has lasted the full span.
-                while len(samples) > 1 and samples[0][0] < cutoff and samples[1][0] <= cutoff:
+                while samples and samples[0][0] < timestamp - MSPT_SUSTAINED_SECONDS:
                     samples.popleft()
                 current[AlertSignal.SUSTAINED_MSPT] = bool(
                     len(samples) >= MSPT_MIN_SAMPLES
-                    and timestamp - samples[0][0] >= MSPT_SUSTAINED_SECONDS
-                    and all((later - earlier) <= MSPT_SUSTAINED_SECONDS / (MSPT_MIN_SAMPLES - 1) * 2
-                            for (earlier, _), (later, _) in zip(samples, list(samples)[1:]))
+                    and samples[0][0] <= timestamp - MSPT_SUSTAINED_SECONDS
                     and all(value >= MSPT_P95_THRESHOLD_MS for _stamp, value in samples)
                 )
 
@@ -175,8 +169,7 @@ class PerformanceAlertEvaluator:
             if rss is not None:
                 samples = self._rss[profile_id]
                 samples.append((timestamp, rss))
-                cutoff = timestamp - MEMORY_GROWTH_WINDOW_SECONDS
-                while len(samples) > 1 and samples[0][0] < cutoff and samples[1][0] <= cutoff:
+                while samples and samples[0][0] < timestamp - MEMORY_GROWTH_WINDOW_SECONDS:
                     samples.popleft()
                 span = timestamp - samples[0][0] if samples else 0
                 growth = rss - samples[0][1] if samples else 0

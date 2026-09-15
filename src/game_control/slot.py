@@ -3,6 +3,8 @@ from __future__ import annotations
 import errno
 import fcntl
 import grp
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -62,6 +64,7 @@ class Reservation:
     controller_start_ticks: int
     expires_at: float
     operation_kind: str = "lifecycle"
+    capability_sha256: str | None = None
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -83,6 +86,7 @@ def _reservation_from_json(raw: dict[str, object] | None) -> Reservation | None:
         ticks = raw["controller_start_ticks"]
         expires = raw["expires_at"]
         operation_kind = raw.get("operation_kind", "lifecycle")
+        capability = raw.get("capability_sha256")
         if (
             not isinstance(operation_id, str)
             or not operation_id
@@ -98,6 +102,15 @@ def _reservation_from_json(raw: dict[str, object] | None) -> Reservation | None:
             or not isinstance(expires, (int, float))
             or isinstance(expires, bool)
             or operation_kind not in {"lifecycle", "update"}
+            or (
+                capability is not None
+                and (
+                    operation_kind != "update"
+                    or not isinstance(capability, str)
+                    or len(capability) != 64
+                    or any(char not in "0123456789abcdef" for char in capability)
+                )
+            )
         ):
             return None
         try:
@@ -106,7 +119,10 @@ def _reservation_from_json(raw: dict[str, object] | None) -> Reservation | None:
             return None
         if not math.isfinite(expiry):
             return None
-        return Reservation(profile, operation_id, generation, pid, ticks, expiry, operation_kind)
+        return Reservation(
+            profile, operation_id, generation, pid, ticks, expiry, operation_kind,
+            capability,
+        )
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -212,6 +228,31 @@ def _atomic_json(path: Path, payload: dict[str, object], mode: int = 0o644) -> N
         temporary_path.unlink(missing_ok=True)
 
 
+def _capability_digest(token: str) -> str:
+    if (
+        not isinstance(token, str)
+        or len(token) != 64
+        or any(char not in "0123456789abcdef" for char in token)
+    ):
+        raise ValueError("handoff capability is malformed")
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _reservation_payload(reservation: Reservation) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "profile_id": reservation.profile_id.value,
+        "operation_id": reservation.operation_id,
+        "state_generation": reservation.state_generation,
+        "controller_pid": reservation.controller_pid,
+        "controller_start_ticks": reservation.controller_start_ticks,
+        "expires_at": reservation.expires_at,
+        "operation_kind": reservation.operation_kind,
+    }
+    if reservation.capability_sha256 is not None:
+        payload["capability_sha256"] = reservation.capability_sha256
+    return payload
+
+
 class ReservationStore:
     def __init__(
         self,
@@ -280,6 +321,7 @@ class ReservationStore:
         controller_pid: int | None = None,
         controller_start_ticks: int | None = None,
         operation_kind: str = "lifecycle",
+        capability_sha256: str | None = None,
     ) -> Reservation:
         if os.geteuid() != 0:
             raise PermissionError("only root may create reservations")
@@ -294,6 +336,14 @@ class ReservationStore:
             raise ValueError("invalid state generation")
         if operation_kind not in {"lifecycle", "update"}:
             raise ValueError("invalid operation kind")
+        if capability_sha256 is not None:
+            if (
+                operation_kind != "update"
+                or not isinstance(capability_sha256, str)
+                or len(capability_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in capability_sha256)
+            ):
+                raise ValueError("invalid handoff capability")
         pid = os.getpid() if controller_pid is None else controller_pid
         ticks = self.pid_start_ticks(pid) if controller_start_ticks is None else controller_start_ticks
         if ticks is None:
@@ -307,16 +357,9 @@ class ReservationStore:
                 ticks,
                 self.clock() + ttl,
                 operation_kind,
+                capability_sha256,
             )
-            _atomic_json(self.reservation_path, {
-                "profile_id": reservation.profile_id.value,
-                "operation_id": reservation.operation_id,
-                "state_generation": reservation.state_generation,
-                "controller_pid": reservation.controller_pid,
-                "controller_start_ticks": reservation.controller_start_ticks,
-                "expires_at": reservation.expires_at,
-                "operation_kind": reservation.operation_kind,
-            })
+            _atomic_json(self.reservation_path, _reservation_payload(reservation))
         return reservation
 
     def reserve_if_available(
@@ -331,6 +374,7 @@ class ReservationStore:
         availability_check: Callable[[], bool] | None = None,
         operation_kind: str = "lifecycle",
         generation_provider: Callable[[], int] | None = None,
+        capability_sha256: str | None = None,
     ) -> Reservation:
         """Atomically check the live owner and commit a reservation.
 
@@ -351,6 +395,14 @@ class ReservationStore:
             raise ValueError("invalid state generation")
         if operation_kind not in {"lifecycle", "update"}:
             raise ValueError("invalid operation kind")
+        if capability_sha256 is not None:
+            if (
+                operation_kind != "update"
+                or not isinstance(capability_sha256, str)
+                or len(capability_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in capability_sha256)
+            ):
+                raise ValueError("invalid handoff capability")
         pid = os.getpid() if controller_pid is None else controller_pid
         ticks = self.pid_start_ticks(pid) if controller_start_ticks is None else controller_start_ticks
         if ticks is None:
@@ -378,16 +430,9 @@ class ReservationStore:
                 profile_id, operation_id, state_generation, pid, ticks,
                 self.clock() + ttl,
                 operation_kind,
+                capability_sha256,
             )
-            _atomic_json(self.reservation_path, {
-                "profile_id": reservation.profile_id.value,
-                "operation_id": reservation.operation_id,
-                "state_generation": reservation.state_generation,
-                "controller_pid": reservation.controller_pid,
-                "controller_start_ticks": reservation.controller_start_ticks,
-                "expires_at": reservation.expires_at,
-                "operation_kind": reservation.operation_kind,
-            })
+            _atomic_json(self.reservation_path, _reservation_payload(reservation))
         return reservation
 
     def release_if_owned(
@@ -541,16 +586,9 @@ class ReservationStore:
                 current.controller_pid, current.controller_start_ticks,
                 self.clock() + ttl,
                 current.operation_kind,
+                current.capability_sha256,
             )
-            _atomic_json(self.reservation_path, {
-                "profile_id": renewed.profile_id.value,
-                "operation_id": renewed.operation_id,
-                "state_generation": renewed.state_generation,
-                "controller_pid": renewed.controller_pid,
-                "controller_start_ticks": renewed.controller_start_ticks,
-                "expires_at": renewed.expires_at,
-                "operation_kind": renewed.operation_kind,
-            })
+            _atomic_json(self.reservation_path, _reservation_payload(renewed))
             return renewed
 
     def renew_if_owned(
@@ -587,17 +625,35 @@ class ReservationStore:
                 current.controller_pid, current.controller_start_ticks,
                 self.clock() + ttl,
                 current.operation_kind,
+                current.capability_sha256,
             )
-            _atomic_json(self.reservation_path, {
-                "profile_id": renewed.profile_id.value,
-                "operation_id": renewed.operation_id,
-                "state_generation": renewed.state_generation,
-                "controller_pid": renewed.controller_pid,
-                "controller_start_ticks": renewed.controller_start_ticks,
-                "expires_at": renewed.expires_at,
-                "operation_kind": renewed.operation_kind,
-            })
+            _atomic_json(self.reservation_path, _reservation_payload(renewed))
             return renewed
+
+    def authorize_handoff(
+        self,
+        profile: str | ProfileId,
+        capability_token: str,
+        *,
+        operation_kind: str = "update",
+    ) -> Reservation:
+        """Authorize a bounded cross-process action under the exact live update lease."""
+        profile_id = _profile(profile)
+        if operation_kind not in {"lifecycle", "update"}:
+            raise ValueError("invalid operation kind")
+        expected = _capability_digest(capability_token)
+        with operation_transaction(self.operation_path):
+            current = self._read_for_admission()
+            if (
+                current is None
+                or not self._live(current)
+                or current.profile_id != profile_id
+                or current.operation_kind != operation_kind
+                or current.capability_sha256 is None
+                or not hmac.compare_digest(current.capability_sha256, expected)
+            ):
+                raise BlockingIOError("handoff capability does not match the live reservation")
+            return current
 
     def valid_for_runner(self, profile: str | ProfileId) -> bool | None:
         """Return True for a matching reservation, False for a live mismatch.

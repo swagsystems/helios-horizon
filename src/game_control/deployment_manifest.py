@@ -508,7 +508,12 @@ _DIRECTORY_SPECS = tuple(
     )
     for item in _DIRECTORIES
 )
-_RUNTIME_SOURCES += ("src/game_control/origin_config.py", "src/game_control/resource_capacity.py")
+_RUNTIME_SOURCES += (
+    "src/game_control/origin_config.py",
+    "src/game_control/resource_capacity.py",
+    "src/game_control/retirement.py",
+    "src/game_control/retirement_command.py",
+)
 
 _MANIFEST = DeploymentManifest(
     1, _PROFILES, _FILES, _DIRECTORY_SPECS,

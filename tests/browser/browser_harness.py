@@ -6,6 +6,14 @@ from contextlib import contextmanager
 from playwright.sync_api import sync_playwright
 
 
+def suspend_background_status(page):
+    """Keep API-count tests independent of finite SSE fixture recovery."""
+    page.evaluate("""() => {
+        Object.defineProperty(document, 'visibilityState', {configurable: true, value: 'hidden'});
+        document.dispatchEvent(new Event('visibilitychange'));
+    }""")
+
+
 @contextmanager
 def browser_page(*, viewport, has_touch=False, init_script=None):
     with sync_playwright() as playwright:

@@ -11,6 +11,47 @@ from typing import Iterator
 
 STATE_DB_PATH = Path("/var/lib/game-control/state.db")
 
+# Durable, append-forever local-payload retirement ledger.  Rows are written and
+# re-classified but never deleted: the `backups` and `backup_protections`
+# history stays intact and no foreign key is bypassed.  Availability is derived
+# from the rows plus the on-disk payload; the table itself is the audit trail.
+RETIREMENT_LEDGER_DDL = """
+    CREATE TABLE IF NOT EXISTS backup_payload_retirement (
+        operation_id TEXT NOT NULL,
+        backup_id TEXT NOT NULL REFERENCES backups(id) ON DELETE RESTRICT,
+        profile_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+            'prepared', 'quarantined', 'purge_prepared', 'purged',
+            'rolled_back', 'failed', 'ambiguous'
+        )),
+        path TEXT NOT NULL,
+        quarantine_path TEXT,
+        expected_device INTEGER NOT NULL,
+        expected_inode INTEGER NOT NULL,
+        expected_size INTEGER NOT NULL,
+        expected_mtime_ns INTEGER NOT NULL,
+        expected_ctime_ns INTEGER NOT NULL,
+        expected_sha256 TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(created_at) = 1),
+        updated_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(updated_at) = 1),
+        error_code TEXT,
+        PRIMARY KEY (operation_id, backup_id)
+    )
+"""
+
+# States that make a payload unavailable for local restore/protection.  A
+# ``rolled_back`` row is deliberately absent: after an identity-verified
+# rollback the payload is present again.
+RETIREMENT_BLOCKING_STATES = (
+    "prepared",
+    "quarantined",
+    "purge_prepared",
+    "purged",
+    "failed",
+    "ambiguous",
+)
+
 _STATE_TABLES = (
     """
     CREATE TABLE IF NOT EXISTS events (
@@ -168,6 +209,7 @@ _STATE_TABLES = (
         progress INTEGER NOT NULL DEFAULT 0
     )
     """,
+    RETIREMENT_LEDGER_DDL,
 )
 
 
@@ -285,7 +327,34 @@ def _migrate_state(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_history_cursor"
         " ON audit(timestamp DESC, id DESC)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_backup_payload_retirement_backup"
+        " ON backup_payload_retirement(backup_id, state)"
+    )
     connection.execute("PRAGMA user_version = 4")
+
+
+def retirement_blocking_states() -> tuple[str, ...]:
+    """Return the ledger states that make a local payload unavailable."""
+
+    return RETIREMENT_BLOCKING_STATES
+
+
+def ensure_additive_state_tables(connection: sqlite3.Connection) -> None:
+    """Create additive feature tables that are not part of the canonical schema.
+
+    ``_STATE_TABLES`` is the exact version-4 schema, and the offline migration
+    utility (``tools/migrations/state_migrate.py``) snapshots a source database
+    as an exact table set.  Feature tables that arrive after a deployment are
+    therefore created idempotently on the already-configured controller
+    connection instead of being appended to that canonical tuple.  They hold
+    bounded, disposable projection data and never gate lifecycle authority.
+    """
+
+    from .startup_estimates import STARTUP_ESTIMATE_DDL
+
+    for statement in STARTUP_ESTIMATE_DDL:
+        connection.execute(statement)
 
 
 def prune_metric_samples(

@@ -49,6 +49,7 @@ PlayerCountResult = _PlayerCountResult
 TelemetryCommand = _TelemetryCommand
 from .state_db import STATE_DB_PATH
 from .status import StatusService
+from .sunlit_update import SunlitUpdateChecker
 from .tps import FIXED_EXPORTER_URL, TpsSampler
 from .telemetry_db import TelemetryDatabase
 from .updates import UpdateRpcFacade, UpdateService
@@ -290,9 +291,26 @@ def build_service_seams(profiles: Any, adapters: Mapping[Any, Any], state_db: An
     status_service.telemetry_collectors, status_service.telemetry_sampler = collector, telemetry_runtime.sampler
     logs = _LogsFacade(profile_map, adapter_map, Redactor(SecretRegistry(secret_values)))
     backups = BackupRpcFacade(profile_map, adapter_map, state_db, b2_transport=b2_transport, sunlit_online_backup=sunlit_online_backup, telemetry_db=telemetry_db)
+    sunlit_checker = (
+        SunlitUpdateChecker()
+        if ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value in profile_map
+        else None
+    )
+    if sunlit_checker is not None and register_owned is not None:
+        register_owned(sunlit_checker, sunlit_checker.close)
     update_services: dict[str, UpdateService] = {}
     for key, profile in profile_map.items():
-        update = UpdateService({key: profile}, database=state_db, backup_service=backups.services[key])
+        update = UpdateService(
+            {key: profile},
+            database=state_db,
+            backup_service=backups.services[key],
+            manual_checker=(
+                sunlit_checker.check
+                if sunlit_checker is not None
+                and key == ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
+                else None
+            ),
+        )
         update_services[key] = update
         if register_owned is not None:
             register_owned(update, update.aclose)

@@ -292,7 +292,7 @@ def test_session_recovery_bootstraps_after_restart_without_refresh_loop(sunlit_p
     state = page.evaluate("() => window.__horizonTest.sessionState()")
     assert state["expired"] is False
     assert state["expiryCount"] == 0
-    assert page.locator("#conn-state").inner_text() in {"Live", "Reconnecting…"}
+    assert page.locator("#conn-state").inner_text() in {"Live", "Polling", "Reconnecting…"}
 
 
 def test_prolonged_gateway_failure_stays_recoverable_and_retry_loads(sunlit_page: Page):

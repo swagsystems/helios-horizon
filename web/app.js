@@ -47,6 +47,7 @@ const state = {
   forceProfile: null,
   restoreProfile: null,
   updateProfile: null,
+  updateApplySupported: false,
   logs: new Map(),
   cpuSamples: new Map(),
   metricSamples: new Map(),
@@ -61,6 +62,12 @@ const state = {
   configRestartRequired: new Map(),
   lastGeneration: 0,
   statusConfirmed: false,
+  lastStatusAt: 0,
+  // Accepted-sample counter plus the fence the estimate may not cross: a hidden
+  // tab, a dropped stream, or a resume leaves cached statuses in memory that
+  // are still recent, so only a sample accepted after the fence may render.
+  statusSeq: 0,
+  estimateFenceSeq: 0,
   loadFailed: false,
   perf: { firstStatusPaint: false, pendingMutations: new Map(), clientQueue: [], clientTimer: null },
 };
@@ -80,7 +87,24 @@ const SESSION_REDIRECT_KEY = "horizon-session-redirected";
 const SESSION_BOOTSTRAP_DELAYS = [0, 250, 1000];
 const SESSION_BOOTSTRAP_TIMEOUT_MS = 4000;
 const SESSION_BOOTSTRAP_DEADLINE_MS = 7000;
-const stream = { source: null, lastEventAt: 0, lastEventId: null, retryMs: 3000, watchdog: null, pollTimer: null, reconnectTimer: null, reconnectStartedAt: null, suspended: false };
+const STATUS_STALE_MS = 30000;
+const stream = { source: null, lastEventAt: 0, lastStatusAt: 0, openedAt: 0, lastEventId: null, retryMs: 3000, watchdog: null, pollTimer: null, pollRequest: null, pollController: null, epoch: 0, reconnectTimer: null, reconnectStartedAt: null, suspended: false };
+const STARTUP_ESTIMATE_STORAGE_KEY = "helios-startup-estimate";
+// Experimental opt-in estimate: the fill never reaches 100 unless the
+// authoritative readiness gate (running + healthy + required ports + owner)
+// is satisfied by the current status.
+const STARTUP_ESTIMATE_CAP = 95;
+const STARTUP_ESTIMATE_TICK_MS = 1000;
+// Successful starts recorded for one profile and version before a numeric
+// median exists (mirrors the controller's MIN_SAMPLES).
+const STARTUP_ESTIMATE_MIN_SAMPLES = 5;
+// `null` means this tab has not made a choice yet, so the stored value (and any
+// cross-tab change) is authoritative. A boolean is this tab's own choice, kept
+// even when the storage write itself was denied.
+let startupEstimatePreferred = null;
+const startupEstimate = { profileId: null, attemptId: null, version: null, serverSample: null, ready: false, anchoredAt: 0, elapsedAtAnchor: null, medianSeconds: null, sampleCount: null, timer: null };
+let updatePollDelay = 1200;
+let updatePollAttempts = 12;
 let reconnectJitter = () => Math.random() * 1000;
 const MAX_STREAM_CURSOR = 9007199254740991n;
 const canonicalStreamCursor = (raw) => {
@@ -261,6 +285,20 @@ function setupShell() {
     if (media.matches) setDrawer(false);
   });
   byId("theme-picker").addEventListener("change", (event) => applyTheme(event.target.value, true));
+  const estimateToggle = byId("startup-estimate-toggle");
+  if (estimateToggle) {
+    syncStartupEstimateToggle();
+    estimateToggle.addEventListener("change", (event) => setStartupEstimateEnabled(event.target.checked));
+  }
+  window.addEventListener("storage", (event) => {
+    if (!isStartupEstimateStorageEvent(event)) return;
+    // Another same-origin tab (or a storage clear) is authoritative: drop any
+    // choice this tab could not persist, then re-render from the stored value
+    // so the toggle and the track never disagree with each other.
+    startupEstimatePreferred = null;
+    syncStartupEstimateToggle();
+    patchActiveSlot();
+  });
   byId("notification-profile").addEventListener("change", (event) => loadNotifications(event.target.value));
   document.querySelectorAll("[data-notification-test]").forEach((button) => button.addEventListener("click", () => testNotification(button.dataset.notificationTest)));
   byId("idle-stop-form").addEventListener("submit", saveIdleStop);
@@ -394,6 +432,10 @@ function uptime(seconds) {
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
   return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+function lifecycleOffline(status) {
+  return Boolean(state.statusConfirmed && status?.state === "stopped");
 }
 
 function formatBytes(bytes) {
@@ -560,7 +602,9 @@ function patchCard(id) {
   card.querySelector(".profile-description").textContent = profile.public_endpoint?.host || "private";
   card.querySelector(".status-badge").className = `status-badge ${stateClass(current)}`;
   card.querySelector(".status-text").textContent = statusLabel(current);
-  card.querySelector(".metric-players").textContent = status.players_online == null ? "—" : `${status.players_online} player${status.players_online === 1 ? "" : "s"}`;
+  card.querySelector(".metric-players").textContent = lifecycleOffline(status)
+    ? "Offline"
+    : status.players_online == null ? "—" : `${status.players_online} player${status.players_online === 1 ? "" : "s"}`;
   card.querySelector(".metric-cpu").textContent = status.cpu_percent == null ? "—" : `${Number(status.cpu_percent).toFixed(1)}%`;
   card.querySelector(".metric-memory").textContent = formatBytes(status.rss_bytes);
   card.querySelector(".metric-version").textContent = formatVersion(status.installed_version);
@@ -622,6 +666,7 @@ function patchActiveSlot() {
     slot.classList.remove("is-transitional");
     manage.hidden = true;
     patchSessionRunway(null, null);
+    patchStartupEstimate(null, null);
     return;
   }
   const name = profileLabel(targetId);
@@ -631,9 +676,10 @@ function patchActiveSlot() {
   byId("session-endpoint").textContent = endpoint || "Unavailable";
   copy.dataset.endpoint = endpoint || "";
   copy.setAttribute("aria-label", `Copy ${name} join address`);
-  byId("active-players").textContent = target.players_online == null ? "Not observed" : String(target.players_online);
-  byId("active-uptime").textContent = uptime(target.uptime_seconds);
-  byId("active-health").textContent = titleCase(target.health);
+  const offline = lifecycleOffline(target);
+  byId("active-players").textContent = offline ? "Offline" : target.players_online == null ? "Not observed" : String(target.players_online);
+  byId("active-uptime").textContent = offline ? "Offline" : uptime(target.uptime_seconds);
+  byId("active-health").textContent = offline ? "Offline" : titleCase(target.health);
   slot.classList.toggle("is-empty", target.state === "stopped" || !ownerId);
   slot.classList.toggle("is-transitional", ["starting", "stopping"].includes(target.state));
   manage.href = `#/servers/${encodeURIComponent(targetId)}/console`;
@@ -651,6 +697,7 @@ function patchActiveSlot() {
   primary.dataset.sessionProfileId = targetId;
   primary.disabled = !state.statusConfirmed || model.action === "none";
   patchSessionRunway(target, ownerId);
+  patchStartupEstimate(target, ownerId);
   if (state.session.profileId !== targetId) {
     state.session = { profileId: targetId, latestBackup: null, backupState: "loading", operation: null };
     loadSessionBackup(targetId);
@@ -705,17 +752,12 @@ function patchSessionRunway(status, ownerId) {
   const phases = [...byId("session-runway").querySelectorAll("[data-session-phase]")];
   const current = status?.state || "unknown";
   const conflict = ownerId && status?.profile_id && ownerId !== status.profile_id;
-  const processSeen = status?.pid != null || current === "running" || Boolean(status?.required_ports_ready);
   const complete = {
     request: ["starting", "running", "stopping"].includes(current),
-    process: processSeen,
-    port: Boolean(status?.required_ports_ready),
+    process: current === "running",
     ready: current === "running" && Boolean(status?.required_ports_ready) && status?.health === "healthy" && ownerId === status?.profile_id,
   };
-  const active = current === "starting"
-    ? (processSeen ? "port" : "process")
-    : current === "running" && !status?.required_ports_ready ? "port"
-      : current === "stopping" ? "request" : null;
+  const active = current === "starting" ? "process" : current === "stopping" ? "request" : null;
   phases.forEach((phase) => {
     const key = phase.dataset.sessionPhase;
     let next = complete[key] ? "complete" : "waiting";
@@ -732,10 +774,215 @@ function patchSessionRunway(status, ownerId) {
   const activePhase = phases.find((phase) => phase.dataset.state === "active");
   const failedPhase = phases.find((phase) => ["failed", "conflict"].includes(phase.dataset.state));
   byId("session-readiness-summary").textContent = failedPhase
-    ? `Readiness: ${failedPhase.querySelector("strong").textContent.toLowerCase()} ${failedPhase.dataset.state === "conflict" ? "blocked" : "failed"}`
+    ? `Readiness: start ${failedPhase.dataset.state === "conflict" ? "blocked" : "failed"}`
     : activePhase
-      ? `Readiness: ${completed} of 4 checks complete · ${activePhase.querySelector("strong").textContent.toLowerCase()} in progress`
-      : `Readiness: ${completed} of 4 checks complete`;
+      ? `Readiness: ${completed} of ${phases.length} stages complete · ${activePhase.querySelector("strong").textContent.toLowerCase()} in progress`
+      : `Readiness: ${completed} of ${phases.length} stages complete`;
+}
+
+function startupEstimateEnabled() {
+  // An explicit choice in this tab wins: when the storage write was denied the
+  // toggle must still control the feature for this page instead of silently
+  // losing to a stale stored value.
+  if (startupEstimatePreferred !== null) return startupEstimatePreferred;
+  try {
+    const stored = localStorage.getItem(STARTUP_ESTIMATE_STORAGE_KEY);
+    if (stored === "1") return true;
+    if (stored === "0") return false;
+  } catch {}
+  return false;
+}
+
+function setStartupEstimateEnabled(enabled) {
+  startupEstimatePreferred = Boolean(enabled);
+  try { localStorage.setItem(STARTUP_ESTIMATE_STORAGE_KEY, enabled ? "1" : "0"); } catch {}
+  syncStartupEstimateToggle();
+  patchActiveSlot();
+}
+
+function syncStartupEstimateToggle() {
+  const toggle = byId("startup-estimate-toggle");
+  if (toggle) toggle.checked = startupEstimateEnabled();
+}
+
+function isStartupEstimateStorageEvent(event) {
+  // sessionStorage events from other frames are unrelated to this opt-in, and
+  // the localStorage getter itself can throw in restricted contexts.
+  let area = null;
+  try { area = localStorage; } catch {}
+  // Real localStorage events (including clear, which carries a null key) name
+  // localStorage as their area; without a readable area nothing is
+  // authoritative, so synthetic area-less events are ignored.
+  if (!area || event.storageArea !== area) return false;
+  return event.key === null || event.key === STARTUP_ESTIMATE_STORAGE_KEY;
+}
+
+function startupEstimateStatusFresh() {
+  // The estimate is a read-only projection, so it does not use the stricter
+  // action gate `state.statusConfirmed`; instead a sample must be fresh AND
+  // accepted after the last hide/disconnect/resume fence, and the page must
+  // still hold a live visible stream.
+  if (!pageVisible() || stream.suspended || sessionExpired) return false;
+  if (state.statusSeq <= state.estimateFenceSeq) return false;
+  const at = state.lastStatusAt;
+  return Boolean(at) && Date.now() - at < STATUS_STALE_MS;
+}
+
+function fenceStartupEstimate() {
+  // Called whenever cached statuses stop being proof of current state: the tab
+  // went hidden, the stream dropped, or a resume started.
+  state.estimateFenceSeq = state.statusSeq;
+  clearStartupEstimate();
+}
+
+function clearStartupEstimate() {
+  if (startupEstimate.timer) { window.clearInterval(startupEstimate.timer); startupEstimate.timer = null; }
+  startupEstimate.profileId = null;
+  startupEstimate.attemptId = null;
+  startupEstimate.version = null;
+  startupEstimate.serverSample = null;
+  startupEstimate.ready = false;
+  startupEstimate.anchoredAt = 0;
+  startupEstimate.elapsedAtAnchor = null;
+  startupEstimate.medianSeconds = null;
+  startupEstimate.sampleCount = null;
+  const node = byId("startup-estimate");
+  if (node) node.hidden = true;
+}
+
+function formatEstimateDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return minutes < 10 && rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
+function renderStartupEstimate(ready = false) {
+  const node = byId("startup-estimate");
+  const track = byId("startup-estimate-track");
+  const fill = byId("startup-estimate-fill");
+  const note = byId("startup-estimate-note");
+  if (!node || !track || !fill || !note) return;
+  node.hidden = false;
+  const setProgress = (percent, mode, text) => {
+    track.dataset.mode = mode;
+    if (percent == null) track.removeAttribute("aria-valuenow");
+    else track.setAttribute("aria-valuenow", String(percent));
+    track.setAttribute("aria-valuetext", text);
+    fill.style.width = `${percent || 0}%`;
+    note.textContent = text;
+  };
+  if (ready) {
+    setProgress(100, "ready", "Ready to join");
+    return;
+  }
+  const median = startupEstimate.medianSeconds;
+  const anchor = startupEstimate.elapsedAtAnchor;
+  // Numeric progress needs both bounded history and a server-provided attempt
+  // elapsed; anything missing stays explicitly unestimated.
+  if (median == null || anchor == null) {
+    setProgress(null, "learning", learningStartupEstimateText());
+    return;
+  }
+  const elapsed = anchor + Math.max(0, Date.now() - startupEstimate.anchoredAt) / 1000;
+  if (elapsed >= median) {
+    setProgress(STARTUP_ESTIMATE_CAP, "overrun", "Taking longer than usual…");
+    return;
+  }
+  const percent = Math.max(1, Math.min(STARTUP_ESTIMATE_CAP - 1, Math.round((elapsed / median) * 100)));
+  setProgress(percent, "estimated", `${percent}% · about ${formatEstimateDuration(median - elapsed)} remaining`);
+}
+
+function learningStartupEstimateText() {
+  // Numeric progress needs five successful starts for this exact version; the
+  // count shown is the server's recorded count, never a fabrication.
+  const recorded = startupEstimate.sampleCount;
+  if (!Number.isFinite(recorded) || recorded <= 0) {
+    return `Learning startup time… ${STARTUP_ESTIMATE_MIN_SAMPLES} successful starts needed`;
+  }
+  return `Learning startup time… ${Math.min(recorded, STARTUP_ESTIMATE_MIN_SAMPLES)} of ${STARTUP_ESTIMATE_MIN_SAMPLES} starts recorded`;
+}
+
+function patchStartupEstimate(status, ownerId) {
+  const node = byId("startup-estimate");
+  if (!node) return;
+  const estimate = status?.startup_estimate && typeof status.startup_estimate === "object" ? status.startup_estimate : null;
+  const current = status?.state || "unknown";
+  const profileId = typeof status?.profile_id === "string" ? status.profile_id : null;
+  const ready = readinessGateSatisfied(status, ownerId);
+  if (!startupEstimateEnabled() || !startupEstimateStatusFresh()) {
+    clearStartupEstimate();
+    return;
+  }
+  if (startupEstimate.ready) {
+    // A completed run stays visible at 100 while that same run is still
+    // authoritative-ready; leaving readiness, ownership, or the profile clears it.
+    if (ready && profileId === startupEstimate.profileId) { renderStartupEstimate(true); return; }
+    clearStartupEstimate();
+    return;
+  }
+  // The genuine 100 arrives with the running/healthy/ports/owner status after
+  // the attempt we were already tracking; the estimate itself is gone by then.
+  if (ready && profileId && profileId === startupEstimate.profileId && startupEstimate.attemptId) {
+    startupEstimate.ready = true;
+    if (startupEstimate.timer) { window.clearInterval(startupEstimate.timer); startupEstimate.timer = null; }
+    renderStartupEstimate(true);
+    return;
+  }
+  if (current !== "starting" || !estimate || (ownerId && ownerId !== profileId)) {
+    clearStartupEstimate();
+    return;
+  }
+  const attemptId = typeof estimate.attempt_id === "string" && estimate.attempt_id ? estimate.attempt_id : null;
+  const version = typeof estimate.version === "string" && estimate.version ? estimate.version : null;
+  const elapsed = Number.isFinite(estimate.elapsed_seconds) && estimate.elapsed_seconds >= 0 ? Number(estimate.elapsed_seconds) : null;
+  const median = Number.isFinite(estimate.median_seconds) && estimate.median_seconds > 0 ? Number(estimate.median_seconds) : null;
+  const sampleCount = Number.isFinite(estimate.sample_count) && estimate.sample_count >= 0 ? Math.floor(Number(estimate.sample_count)) : null;
+  if (profileId !== startupEstimate.profileId || attemptId !== startupEstimate.attemptId || version !== startupEstimate.version) {
+    // A new profile, run, or version starts a fresh estimate.
+    startupEstimate.serverSample = null;
+    startupEstimate.elapsedAtAnchor = null;
+    startupEstimate.anchoredAt = 0;
+    startupEstimate.medianSeconds = null;
+    startupEstimate.profileId = profileId;
+    startupEstimate.attemptId = attemptId;
+    startupEstimate.version = version;
+  }
+  // Only a NEW authoritative status sample re-anchors; incidental re-renders
+  // must not pull an already-advanced estimate backwards.
+  const serverSample = attemptId && elapsed != null ? `${attemptId}:${version || ""}:${elapsed}` : null;
+  if (serverSample !== startupEstimate.serverSample) {
+    startupEstimate.serverSample = serverSample;
+    startupEstimate.elapsedAtAnchor = attemptId ? elapsed : null;
+    startupEstimate.anchoredAt = Date.now();
+  }
+  startupEstimate.medianSeconds = median;
+  startupEstimate.sampleCount = sampleCount;
+  if (startupEstimate.elapsedAtAnchor != null) {
+    if (!startupEstimate.timer) {
+      startupEstimate.timer = window.setInterval(() => {
+        if (!startupEstimateStatusFresh()) { clearStartupEstimate(); return; }
+        patchStartupEstimate(state.statuses.get(startupEstimate.profileId), slotOwnerId());
+      }, STARTUP_ESTIMATE_TICK_MS);
+    }
+  } else if (startupEstimate.timer) {
+    window.clearInterval(startupEstimate.timer);
+    startupEstimate.timer = null;
+  }
+  renderStartupEstimate(false);
+}
+
+function readinessGateSatisfied(status, ownerId) {
+  // Same authoritative readiness criterion the session runway already uses.
+  return Boolean(
+    status &&
+    status.state === "running" &&
+    status.health === "healthy" &&
+    status.required_ports_ready &&
+    ownerId &&
+    ownerId === status.profile_id
+  );
 }
 
 function patchSessionBackup() {
@@ -746,7 +993,8 @@ function patchSessionBackup() {
   if (!backup) { node.textContent = "Not recorded"; return; }
   const date = backup.created_at ? new Date(backup.created_at) : null;
   const stamp = date && !Number.isNaN(date.getTime()) ? date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "date unavailable";
-  node.textContent = `${backup.verified ? "Verified" : "Unverified"} ${stamp}`;
+  const suffix = backupAvailable(backup) ? "" : ` · ${availabilityLabel(backupAvailability(backup))}`;
+  node.textContent = `${backup.verified ? "Verified" : "Unverified"} ${stamp}${suffix}`;
 }
 
 async function loadSessionBackup(id) {
@@ -785,7 +1033,7 @@ function observeSessionOperation(status) {
   const stateValue = status.state || "unknown";
   if (operation.kind === "start" && stateValue === "running" && status.required_ports_ready && status.health === "healthy" && status.slot_owner === status.profile_id) {
     operation.result = "complete";
-    operation.message = `${profileLabel(status.profile_id)} reached healthy game readiness. This tab notice is transient; the Audit trail is durable.`;
+    operation.message = `${profileLabel(status.profile_id)} is ready.`;
   } else if (operation.kind === "stop" && stateValue === "stopped") {
     operation.result = "complete";
     operation.message = `${profileLabel(status.profile_id)} stopped safely.`;
@@ -796,11 +1044,18 @@ function observeSessionOperation(status) {
 }
 
 function applyStatus(snapshot, { confirmed = false } = {}) {
-  if (!snapshot || !Array.isArray(snapshot.profiles)) return;
+  if (!snapshot || !Array.isArray(snapshot.profiles)) return false;
   const generation = Number(snapshot.generation);
-  if (Number.isFinite(generation) && generation < state.lastGeneration) return;
+  if (!Number.isSafeInteger(generation) || generation < state.lastGeneration) return false;
+  if (snapshot.profiles.some((item) => !item || typeof item.profile_id !== "string" || !["unknown", "stopped", "starting", "running", "stopping", "failed", "blocked"].includes(item.state))) return false;
   if (Number.isFinite(generation)) state.lastGeneration = generation;
   if (confirmed) state.statusConfirmed = true;
+  // Every applied snapshot is fresh data; the age is what bounds local
+  // startup-estimate interpolation when the stream or poll goes quiet.
+  state.lastStatusAt = Date.now();
+  // Only a valid snapshot naming a known profile counts as a fresh sample for
+  // the estimate fence: malformed or unrelated payloads never revive the track.
+  if (snapshot.profiles.some((item) => item?.profile_id && state.profiles.has(item.profile_id))) state.statusSeq += 1;
   snapshot.profiles.forEach((item) => {
     if (!item?.profile_id) return;
     const previous = state.statuses.get(item.profile_id) || {};
@@ -857,6 +1112,7 @@ function applyStatus(snapshot, { confirmed = false } = {}) {
     byId("last-updated").textContent = `Generation ${state.lastGeneration}`;
   }
   if (state.detail.id) patchDetail(state.detail.id);
+  return true;
 }
 
 async function api(path, options = {}) {
@@ -899,7 +1155,8 @@ async function api(path, options = {}) {
       testApiResponseDelay -= 1;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-  } catch {
+  } catch (error) {
+    if (options.signal?.aborted || error?.name === "AbortError") throw error;
     if (!options.method || options.method === "GET") {
       await new Promise((resolve) => setTimeout(resolve, 1500));
       try { response = await attempt(); } catch (retryError) {
@@ -1262,40 +1519,65 @@ function connectStream() {
   const cursor = stream.lastEventId === null ? "" : `?after=${encodeURIComponent(stream.lastEventId)}`;
   const source = new EventSource(`/api/v1/stream${cursor}`);
   stream.source = source;
+  stream.openedAt = Date.now();
+  stream.lastStatusAt = 0;
+  setConnState("reconnecting");
   const alive = () => {
     if (stream.suspended || stream.source !== source) return;
+    stream.lastEventAt = Date.now();
+  };
+  source.onopen = alive;
+  source.addEventListener("heartbeat", alive);
+  const applyStreamEvent = (event) => {
+    if (stream.suspended || stream.source !== source) return;
+    alive();
+    let snapshot;
+    try { snapshot = JSON.parse(event.data); } catch { return; }
+    if (!applyStatus(snapshot)) return;
+    recordStreamCursor(source, event);
+    // An empty or irrelevant payload cannot establish freshness for the cards.
+    if (!snapshot.profiles.some((item) => state.profiles.has(item.profile_id))) return;
+    stream.lastStatusAt = Date.now();
     if (stream.reconnectStartedAt !== null) {
       markPerformance("horizon-sse-reconnect-end");
       measurePerformance("horizon-sse-reconnect-gap", "horizon-sse-reconnect-start", "horizon-sse-reconnect-end");
       stream.reconnectStartedAt = null;
     }
-    stream.lastEventAt = Date.now(); stream.retryMs = 3000; setConnState("live"); stopFallbackPolling();
+    stream.retryMs = 3000; setConnState("live"); stopFallbackPolling();
   };
-  source.onopen = alive;
-  source.addEventListener("heartbeat", alive);
-  const applyStreamEvent = (event) => { if (stream.suspended || stream.source !== source) return; recordStreamCursor(source, event); alive(); try { applyStatus(JSON.parse(event.data)); } catch {} };
   source.addEventListener("status", applyStreamEvent);
   source.onmessage = applyStreamEvent;
   source.onerror = () => {
     if (stream.suspended || stream.source !== source) return;
     setConnState("reconnecting");
+    startFallbackPolling();
     if (source.readyState === EventSource.CLOSED) {
-      startFallbackPolling();
       scheduleReconnect();
     }
   };
   // Recurring timer: connection watchdog; callback is visibility-gated.
-  if (!stream.watchdog) stream.watchdog = window.setInterval(() => {
-    if (!pageVisible()) return;
-    if (stream.source && Date.now() - stream.lastEventAt > 45000) { setConnState("reconnecting"); scheduleReconnect(); }
-  }, 10000);
+  if (!stream.watchdog) stream.watchdog = window.setInterval(checkStreamFreshness, 10000);
+}
+
+function checkStreamFreshness() {
+  // Ready (timer stopped) and learning (no elapsed) estimates have no local
+  // tick, so the watchdog must also drop a stale estimate before its own
+  // transport early-return.
+  if (!startupEstimateStatusFresh()) clearStartupEstimate();
+  if (!pageVisible() || stream.suspended || sessionExpired || !stream.source) return;
+  if (Date.now() - (stream.lastStatusAt || stream.openedAt) >= STATUS_STALE_MS || Date.now() - stream.lastEventAt > 45000) {
+    setConnState("reconnecting");
+    startFallbackPolling();
+    scheduleReconnect();
+  }
 }
 
 function setConnState(mode) {
+  if (mode === "offline" || mode === "reconnecting") fenceStartupEstimate();
   const pill = byId("conn-state");
   if (!pill) return;
   pill.dataset.state = mode;
-  pill.textContent = mode === "live" ? "Live" : mode === "reconnecting" ? "Reconnecting…" : "Offline";
+  pill.textContent = mode === "live" ? "Live" : mode === "polling" ? "Polling" : mode === "reconnecting" ? "Reconnecting…" : "Offline";
 }
 
 function scheduleReconnect() {
@@ -1326,21 +1608,44 @@ function scheduleReconnect() {
 }
 
 function startFallbackPolling() {
-  if (!pageVisible() || stream.suspended) return;
+  if (!pageVisible() || stream.suspended || sessionExpired) return;
   if (stream.pollTimer) return;
   // Recurring timer: REST status fallback; callback is visibility-gated.
-  stream.pollTimer = window.setInterval(async () => {
-    if (!pageVisible()) return;
-    try { applyStatus(await api("/api/v1/status"), { confirmed: true }); } catch { setConnState("offline"); }
-  }, 10000);
+  stream.pollTimer = window.setInterval(pollStatus, 10000);
+  void pollStatus();
+}
+
+async function pollStatus() {
+  if (!pageVisible() || stream.suspended || sessionExpired || !stream.pollTimer || stream.pollRequest) return;
+  const epoch = stream.epoch;
+  const controller = new AbortController();
+  stream.pollController = controller;
+  const timeout = window.setTimeout(() => controller.abort(), 10000);
+  const request = api("/api/v1/status", { signal: controller.signal });
+  stream.pollRequest = request;
+  try {
+    const snapshot = await request;
+    if (epoch !== stream.epoch || !pageVisible() || stream.suspended || !stream.pollTimer) return;
+    if (!applyStatus(snapshot, { confirmed: true }) || !snapshot.profiles.some((item) => state.profiles.has(item.profile_id))) throw new Error("Status unavailable");
+    setConnState("polling");
+  } catch {
+    if (epoch === stream.epoch && pageVisible() && !stream.suspended && stream.pollTimer) setConnState("offline");
+  } finally {
+    window.clearTimeout(timeout);
+    if (stream.pollRequest === request) stream.pollRequest = null;
+    if (stream.pollController === controller) stream.pollController = null;
+  }
 }
 
 function stopFallbackPolling() {
   if (stream.pollTimer) { window.clearInterval(stream.pollTimer); stream.pollTimer = null; }
+  stream.pollController?.abort();
 }
 
 function suspendStream() {
+  fenceStartupEstimate();
   stream.suspended = true;
+  stream.epoch += 1;
   if (stream.reconnectTimer) { window.clearTimeout(stream.reconnectTimer); stream.reconnectTimer = null; }
   if (stream.watchdog) { window.clearInterval(stream.watchdog); stream.watchdog = null; }
   stopFallbackPolling();
@@ -1355,6 +1660,7 @@ async function resumeStream() {
   stream.suspended = false;
   if (!wasSuspended && stream.source && stream.source.readyState !== window.EventSource?.CLOSED) return;
   state.statusConfirmed = false;
+  fenceStartupEstimate();
   state.profiles.forEach((_profile, id) => patchCard(id));
   patchActiveSlot();
   // One full snapshot closes the event gap while the browser was hidden.  SSE
@@ -1420,7 +1726,7 @@ async function mutate(id, operation) {
     result: "pending",
     startedAt: new Date().toISOString(),
     jobId: null,
-    message: `${titleCase(operation)} request is being sent to Horizon. This tab notice is transient; the Audit trail is durable.`,
+    message: `${titleCase(operation)} request is being sent to Horizon.`,
   } : null;
   if (id === sessionProfileId()) {
     state.session.operation = sessionOperation;
@@ -1463,7 +1769,7 @@ async function mutate(id, operation) {
       if (sessionOperation && state.session.operation === sessionOperation) {
         sessionOperation.result = "resolved";
         sessionOperation.jobId = null;
-        sessionOperation.message = `A previous Start resolved, but ${profileLabel(id)} is currently stopped. Start it again when ready. This tab notice is transient; the Audit trail is durable.`;
+        sessionOperation.message = `A previous Start resolved, but ${profileLabel(id)} is currently stopped. Start it again when ready.`;
         patchSessionOperation();
       }
       notify(`${profileLabel(id)} is currently stopped; the previous Start was already resolved.`);
@@ -1473,7 +1779,7 @@ async function mutate(id, operation) {
       sessionOperation.result = "accepted";
       sessionOperation.jobId = accepted?.job_id || null;
       const job = sessionOperation.jobId ? ` Job ${sessionOperation.jobId}.` : "";
-      sessionOperation.message = `${titleCase(operation)} accepted by Horizon.${job} Waiting for observed readiness. This tab notice is transient; the Audit trail is durable.`;
+      sessionOperation.message = `${titleCase(operation)} accepted by Horizon.${job} Waiting for observed readiness.`;
       patchSessionOperation();
     }
     notify(`${titleCase(operation)} requested for ${profileLabel(id)}.`);
@@ -1619,6 +1925,7 @@ function wireDialogForms() {
   byId("update-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (event.submitter?.value === "cancel") { closeDialog(byId("update-dialog")); return; }
+    if (!state.updateApplySupported) return;
     const id = state.updateProfile;
     if (!id) return;
     const confirm = byId("update-confirm");
@@ -1648,6 +1955,11 @@ function openForce(id, opener) {
 }
 
 function openRestore(id, opener, backupId = "") {
+  const record = (state.detail.backups || []).find((item) => item.id === backupId);
+  if (record && !backupAvailable(record)) {
+    notify(`Backup payload is not locally available (${backupAvailability(record)}).`);
+    return;
+  }
   state.restoreProfile = id;
   byId("restore-description").textContent = `Restoring replaces ${profileLabel(id)} world data.`;
   byId("restore-backup-id").value = backupId;
@@ -2481,11 +2793,12 @@ function patchDetail(id) {
   byId("detail-title").textContent = profile.display_name || id;
   byId("detail-subtitle").textContent = profile.public_endpoint?.host || "private";
   const current = status.state || "unknown";
+  const offline = lifecycleOffline(status);
   const metricAvailability = {
     cpu: status.cpu_percent != null,
     memory: status.rss_bytes != null,
     players: status.players_online != null,
-    uptime: status.uptime_seconds != null,
+    uptime: status.uptime_seconds != null || offline,
     disk: status.disk_free_bytes != null,
     "disk-io": status.disk_read_bps != null || status.disk_write_bps != null,
   };
@@ -2534,8 +2847,8 @@ function patchDetail(id) {
   patchCapacityTrack("rail-memory-capacity", memoryValue, memoryCapacity);
   byId("rail-cpu-note").textContent = cpuCapacity > 0 ? "Current / available CPU · 100% per core" : "CPU capacity unavailable";
   byId("rail-memory-note").textContent = memoryCapacity > 0 ? "Current RSS / effective memory limit" : "Memory capacity unavailable";
-  byId("rail-players").textContent = status.players_online == null ? "Unavailable" : String(status.players_online);
-  byId("rail-players-note").textContent = status.players_online == null ? "Player count unavailable" : "Players observed";
+  byId("rail-players").textContent = offline ? "Offline" : status.players_online == null ? "Unavailable" : String(status.players_online);
+  byId("rail-players-note").textContent = offline ? "Server is offline" : status.players_online == null ? "Player count unavailable" : "Players observed";
   byId("rail-version").textContent = formatVersion(status.installed_version);
   const configRestart = state.configRestartRequired.get(id) || [];
   byId("rail-version-note").textContent = configRestart.length ? "Config changed · restart required" : status.restart_required ? "Update available · restart required" : status.required_ports_ready ? "Ready on required ports" : "Accepted; waiting for readiness";
@@ -2545,7 +2858,7 @@ function patchDetail(id) {
   const metricDomain = runKey ? { start: Date.parse(status.started_at), end: Date.now() } : null;
   byId("metric-cpu-current").textContent = cpuText;
   byId("metric-memory-current").textContent = memoryText;
-  byId("metric-players-current").textContent = status.players_online == null ? "Unavailable" : String(status.players_online);
+  byId("metric-players-current").textContent = offline ? "Offline" : status.players_online == null ? "Unavailable" : String(status.players_online);
   const chartHistory = history?.key === runKey ? history : {};
   const sampleTail = (key) => { const past = chartHistory[key] || []; const last = past.at(-1)?.t ?? 0; return [...past, ...(samples[key] || []).filter((point) => point.t > last)]; };
   const gapMs = chartHistory.resolution === "1h" ? 7200000 : chartHistory.resolution === "5m" ? 600000 : 120000;
@@ -2558,7 +2871,7 @@ function patchDetail(id) {
     ? `Since server started ${new Date(metricDomain.start).toLocaleString()} → now. ${chartHistory.stale ? "History refresh unavailable; retaining last observations." : chartHistory.fetchedAt ? "Retained history; gaps mean no observation." : "Loading retained history…"} Player history uses the latest 500 retained observations.${chartHistory.playersStale ? " Player history refresh unavailable." : ""}`
     : current === "stopped" ? "Server stopped · no active run. No offline time is plotted as zero." : "Current run history unavailable until a process start is confirmed.";
   if (runKey && state.detail.tab === "metrics" && history?.key !== runKey) void loadMetricHistory(id);
-  byId("metric-uptime").textContent = uptime(status.uptime_seconds);
+  byId("metric-uptime").textContent = offline ? "Offline" : uptime(status.uptime_seconds);
   byId("metric-disk-free").textContent = formatBytes(status.disk_free_bytes);
   byId("metric-disk-free-note").textContent = profile.mutable_root || "Profile mutable root";
   byId("metric-disk-io").textContent = status.disk_read_bps == null && status.disk_write_bps == null
@@ -2966,17 +3279,58 @@ async function createBackup(id, protectedBackup = false) {
   } catch (error) { notify(error.message || "Backup request failed."); }
 }
 
+async function fetchUpdateStatus(id) {
+  let status = null;
+  for (let attempt = 0; attempt < updatePollAttempts; attempt += 1) {
+    status = await api(`/api/v1/profiles/${encodeURIComponent(id)}/update`);
+    if (status.state !== "checking" || attempt + 1 >= updatePollAttempts) return status;
+    await new Promise((resolve) => setTimeout(resolve, updatePollDelay));
+  }
+  return status;
+}
+
 async function checkForUpdate(id) {
   try {
-    const status = await api(`/api/v1/profiles/${encodeURIComponent(id)}/update`);
-    if (!status.apply_supported || !status.available_version || status.available_version === status.installed_version) {
-      notify(`No update available for ${profileLabel(id)}.`);
+    const status = await fetchUpdateStatus(id);
+    const checkState = status.state || (status.available_version ? "available" : "current");
+    if (checkState === "failed") {
+      notify(status.message || `Update check failed for ${profileLabel(id)}.`);
       return;
     }
+    if (checkState === "checking") {
+      notify(status.message || `The update check for ${profileLabel(id)} is still running.`);
+      return;
+    }
+    if (checkState === "unsupported") {
+      notify(status.message || `Update checks are not available for ${profileLabel(id)}.`);
+      return;
+    }
+    if (checkState === "deferred" && !status.available_version) {
+      notify(status.message || `The automatic update for ${profileLabel(id)} is deferred.`);
+      return;
+    }
+    if (checkState === "stale" && !status.available_version) {
+      notify(status.message || `The update status for ${profileLabel(id)} is stale.`);
+      return;
+    }
+    if (!status.available_version || status.available_version === status.installed_version) {
+      notify(status.message || (checkState === "current" ? `No update available for ${profileLabel(id)}.` : `No verified update available for ${profileLabel(id)}.`));
+      return;
+    }
+    const automatic = !status.apply_supported;
     state.updateProfile = id;
+    state.updateApplySupported = !automatic;
     byId("update-profile").textContent = profileLabel(id);
     byId("update-installed").textContent = formatVersion(status.installed_version);
     byId("update-available").textContent = formatVersion(status.available_version);
+    byId("update-dialog-title").textContent = automatic ? "Automatic update available" : "Apply server update";
+    byId("update-description").textContent = automatic
+      ? (status.message || `Horizon found ${formatVersion(status.available_version)}. The automatic updater handles it during its scheduled safe stopped window.`)
+      : "Horizon found an update. Review the version change before applying it.";
+    const confirm = byId("update-confirm");
+    confirm.hidden = automatic;
+    confirm.disabled = automatic;
+    confirm.textContent = "Apply update";
     setupDialog(byId("update-dialog"), byId("check-update"));
   } catch (error) { notify(error.message || "Update check failed."); }
 }
@@ -3027,6 +3381,21 @@ function renderDetailLogs(item) {
   byId("detail-noise-label").textContent = `Hide network noise · ${hidden} hidden`;
 }
 
+function backupAvailability(backup) {
+  return (backup && backup.local_payload_state) || "present";
+}
+
+function backupAvailable(backup) {
+  return backupAvailability(backup) === "present";
+}
+
+function availabilityLabel(state) {
+  if (state === "present") return "";
+  if (state === "quarantined" || state === "purged") return `Retired · remote copy only (${state})`;
+  if (state === "missing") return "Local copy missing";
+  return `Unavailable (${state})`;
+}
+
 async function loadBackups(id) {
   if (!id) return;
   const list = byId("backup-list");
@@ -3039,12 +3408,23 @@ async function loadBackups(id) {
   list.replaceChildren();
   state.detail.backups.forEach((backup) => {
     const row = document.createElement("li"); row.className = "backup-row";
+    const availability = backupAvailability(backup);
+    if (availability !== "present") row.classList.add("backup-unavailable");
     const idNode = document.createElement("strong"); idNode.textContent = backup.id || "—";
     const time = document.createElement("time"); time.textContent = backup.created_at ? new Date(backup.created_at).toLocaleString() : "—";
     const size = document.createElement("span"); size.textContent = formatBytes(backup.size_bytes);
-    const restore = document.createElement("button"); restore.type = "button"; restore.className = "button button-small button-quiet"; restore.textContent = `Restore ${backup.id || ""}`.trim();
-    restore.addEventListener("click", (event) => openRestore(id, event.currentTarget, backup.id));
-    row.append(idNode, time, size, restore); list.append(row);
+    const restore = document.createElement("button"); restore.type = "button"; restore.className = "button button-small button-quiet";
+    if (availability === "present") {
+      restore.textContent = `Restore ${backup.id || ""}`.trim();
+      restore.addEventListener("click", (event) => openRestore(id, event.currentTarget, backup.id));
+    } else {
+      restore.textContent = "Restore unavailable";
+      restore.disabled = true;
+      restore.title = availabilityLabel(availability);
+    }
+    const status = document.createElement("span"); status.className = "backup-availability";
+    status.textContent = availabilityLabel(availability);
+    row.append(idNode, time, size, status, restore); list.append(row);
   });
   if (!state.detail.backups.length) { const empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "No backups loaded."; list.append(empty); }
 }
@@ -3064,11 +3444,14 @@ async function renderAggregateBackups() {
   const uniqueItems = [...new Map(items.map((backup) => [`${backup.profile_id}:${backup.id || ""}`, backup])).values()];
   uniqueItems.forEach((backup) => {
     const row = document.createElement("li"); row.className = "backup-row";
+    const availability = backupAvailability(backup);
+    if (availability !== "present") row.classList.add("backup-unavailable");
     const label = document.createElement("strong"); label.textContent = `${backup.profile_name} · ${backup.id || "—"}`;
     const time = document.createElement("time"); time.textContent = backup.created_at ? new Date(backup.created_at).toLocaleString() : "—";
     const size = document.createElement("span"); size.textContent = formatBytes(backup.size_bytes);
+    const status = document.createElement("span"); status.className = "backup-availability"; status.textContent = availabilityLabel(availability);
     const link = document.createElement("a"); link.className = "button button-small button-quiet"; link.href = detailTabUrl(backup.profile_id, "backups"); link.textContent = "View backups";
-    row.append(label, time, size, link); list.append(row);
+    row.append(label, time, size, status, link); list.append(row);
   });
   if (!uniqueItems.length) { const empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "No backups loaded."; list.append(empty); }
 }
@@ -3119,7 +3502,13 @@ function setupDetail() {
   byId("detail-force").addEventListener("click", (event) => openForce(state.detail.id, event.currentTarget));
   byId("create-backup")?.addEventListener("click", () => createBackup(state.detail.id, false));
   byId("create-protected-backup")?.addEventListener("click", () => createBackup(state.detail.id, true));
-  byId("check-update")?.addEventListener("click", () => checkForUpdate(state.detail.id));
+  byId("check-update")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    if (button.disabled) return;
+    button.disabled = true;
+    try { await checkForUpdate(state.detail.id); }
+    finally { button.disabled = false; }
+  });
   byId("command-send").addEventListener("click", sendConsoleCommand);
   byId("console-output").addEventListener("scroll", (event) => {
     const id = state.detail.id;
@@ -3294,6 +3683,7 @@ window.addEventListener("resize", () => {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") {
     state.detail.statsAbort?.abort();
+    clearStartupEstimate();
     suspendStream();
     return;
   }
@@ -3318,8 +3708,31 @@ if (window.__HORIZON_TEST__) {
     api,
     load,
     scheduleReconnect,
+    checkStreamFreshness,
+    pollStatus,
+    startupEstimateTick: () => {
+      patchStartupEstimate(
+        startupEstimate.profileId ? state.statuses.get(startupEstimate.profileId) : null,
+        slotOwnerId(),
+      );
+    },
+    patchActiveSlot: () => patchActiveSlot(),
+    startupEstimateState: () => ({
+      attemptId: startupEstimate.attemptId,
+      version: startupEstimate.version,
+      elapsedAtAnchor: startupEstimate.elapsedAtAnchor,
+      anchoredAt: startupEstimate.anchoredAt,
+      medianSeconds: startupEstimate.medianSeconds,
+      ready: startupEstimate.ready,
+      serverSample: startupEstimate.serverSample,
+      enabled: startupEstimateEnabled(),
+      fresh: startupEstimateStatusFresh(),
+      statusConfirmed: state.statusConfirmed,
+      lastStatusAt: state.lastStatusAt,
+    }),
     sessionState: () => ({ expired: sessionExpired, refreshing: Boolean(sessionRefreshPromise), noticeShown: sessionNoticeShown, expiryCount: sessionExpiryCount, generation: sessionGeneration }),
     setReconnectTestTiming: (delay, jitter = () => 0) => { stream.retryMs = delay; reconnectJitter = jitter; },
+    setUpdatePollTiming: (delay, attempts = updatePollAttempts) => { updatePollDelay = delay; updatePollAttempts = attempts; },
     delayNextApiResponse: () => { testApiResponseDelay += 1; },
   };
 }

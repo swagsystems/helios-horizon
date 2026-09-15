@@ -200,20 +200,6 @@ class ScheduleSpec(RpcModel):
     rollback_safe: bool = False
     public_wake_policy: Literal["disabled", "safe"] = "disabled"
 
-    @model_validator(mode="before")
-    @classmethod
-    def infer_operation(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "operation" not in value:
-            value = dict(value)
-            value["operation"] = "backup" if value.get("backup_destination") is not None else "switch"
-        return value
-
-    @model_validator(mode="after")
-    def backup_requires_destination(self):
-        if self.operation == "backup" and self.backup_destination is None:
-            raise ValueError("backup schedules require a destination")
-        return self
-
     @field_validator("cron")
     @classmethod
     def validate_cron_text(cls, value: str) -> str:
@@ -241,9 +227,6 @@ class ScheduleView(RpcModel):
     baseline_preset: str | None = None
     candidate_preset: str | None = None
     campaign: str | None = None
-    maintenance_window: bool = False
-    rollback_safe: bool = False
-    public_wake_policy: Literal["disabled", "safe"] = "disabled"
 
 
 class ScheduleResponse(RpcModel):
@@ -412,6 +395,12 @@ class CreateBackup(RpcModel):
     profile_id: ProfileId
     protected: bool = False
     destination: BackupDestination = BackupDestination.LOCAL
+    # Transport-only authorization token for the Sunlit update handoff.  It is
+    # never part of the durable request identity, and ``repr=False`` keeps it
+    # out of model/validation repr output and error text.
+    reservation_capability: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", repr=False
+    )
 
 
 class PrepareRestore(RpcModel):
@@ -454,6 +443,29 @@ class ConfirmUpdate(RpcModel):
 class GetNotificationConfig(RpcModel):
     kind: Literal["get_notification_config"]
     profile_id: ProfileId
+
+
+RetirementPhase = Literal["quarantine", "purge", "rollback"]
+PayloadAvailability = Literal[
+    "present", "missing", "prepared", "quarantined", "purge_prepared",
+    "purged", "rolled_back", "failed", "ambiguous",
+]
+
+
+class GetRetirementStatus(RpcModel):
+    kind: Literal["get_retirement_status"]
+    operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class PrepareRetirement(RpcModel):
+    kind: Literal["prepare_retirement"]
+    operation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    phase: RetirementPhase
+
+
+class ConfirmRetirement(RpcModel):
+    kind: Literal["confirm_retirement"]
+    confirmation_id: str = Field(min_length=32, max_length=128)
 
 
 class SetNotificationRule(RpcModel):
@@ -510,7 +522,10 @@ RpcAction: TypeAlias = Annotated[
     | ConfirmUpdate
     | GetNotificationConfig
     | SetNotificationRule
-    | TestNotification,
+    | TestNotification
+    | GetRetirementStatus
+    | PrepareRetirement
+    | ConfirmRetirement,
     Field(discriminator="kind"),
 ]
 
@@ -539,6 +554,8 @@ class ErrorCode(StrEnum):
     CONFIRMATION_EXPIRED = "confirmation_expired"
     CONFIRMATION_MISMATCH = "confirmation_mismatch"
     REQUEST_ID_CONFLICT = "request_id_conflict"
+    RETIREMENT_FAILED = "retirement_failed"
+    RETIREMENT_UNAVAILABLE = "retirement_unavailable"
     UNAUTHORIZED_PEER = "unauthorized_peer"
     INVALID_REQUEST = "invalid_request"
     INVALID_STATE = "invalid_state"
@@ -581,6 +598,23 @@ class PublicProfile(RpcModel):
     idle_stop_minutes: int = Field(ge=0, le=1440)
 
 
+class StartupEstimate(RpcModel):
+    """Controller-owned startup estimate for the current run.
+
+    ``sample_count`` and ``median_seconds`` come from the bounded per-profile,
+    per-version history.  ``attempt_id``/``elapsed_seconds`` identify the
+    authoritative in-flight attempt so an observing browser can resume the
+    same estimate instead of restarting at zero.  The fields are absent for
+    producers that do not collect them.
+    """
+
+    sample_count: int = Field(default=0, ge=0, le=25)
+    median_seconds: float | None = Field(default=None, gt=0, le=900)
+    attempt_id: str | None = Field(default=None, max_length=64)
+    elapsed_seconds: float | None = Field(default=None, ge=0, le=86400)
+    version: str | None = Field(default=None, max_length=64)
+
+
 class ProfileStatus(RpcModel):
     profile_id: ProfileId
     state: ObservedState
@@ -599,6 +633,7 @@ class ProfileStatus(RpcModel):
     disk_free_bytes: int | None = None
     disk_read_bps: float | None = None
     disk_write_bps: float | None = None
+    startup_estimate: StartupEstimate | None = None
 
 
 class StatusSnapshot(RpcModel):
@@ -660,6 +695,7 @@ class BackupSummary(RpcModel):
     size_bytes: int = Field(ge=0)
     verified: bool
     protected: bool
+    local_payload_state: PayloadAvailability = "present"
 
 
 class BackupPage(RpcModel):
@@ -751,12 +787,46 @@ class UpdateConfirmation(ConfirmationBase):
     available_version: str | None
 
 
+class RetirementConfirmation(ConfirmationBase):
+    action: Literal["retirement"]
+    operation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    phase: RetirementPhase
+    destination_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    count: int = Field(ge=1)
+    bytes: int = Field(ge=0)
+    profile_ids: tuple[str, ...] = ()
+
+
+class RetirementEntryStatus(RpcModel):
+    backup_id: str
+    profile_id: str
+    state: str = Field(max_length=32)
+    error_code: str | None = Field(default=None, max_length=64)
+
+
+class RetirementReconcileEntry(RpcModel):
+    backup_id: str
+    profile_id: str
+    ledger_state: str = Field(max_length=32)
+    classification: str = Field(max_length=32)
+
+
+class RetirementStatus(RpcModel):
+    operation_id: str = ""
+    counts: dict[str, int] = Field(default_factory=dict)
+    entries: tuple[RetirementEntryStatus, ...] = ()
+    reconciled: tuple[RetirementReconcileEntry, ...] = ()
+    sender_lock_available: bool = True
+    noreplace_supported: bool = True
+
+
 ConfirmationSummary: TypeAlias = Annotated[
     SwitchConfirmation
     | ForceStopConfirmation
     | RestoreConfirmation
     | WorldCloneConfirmation
-    | UpdateConfirmation,
+    | UpdateConfirmation
+    | RetirementConfirmation,
     Field(discriminator="action"),
 ]
 
@@ -768,6 +838,12 @@ class UpdateStatus(RpcModel):
     available_version: str | None
     restart_required: bool
     apply_supported: bool
+    state: Literal[
+        "unknown", "current", "available", "deferred", "stale", "failed",
+        "checking", "unsupported",
+    ] = "unknown"
+    message: str | None = Field(default=None, max_length=200)
+    checked_at: datetime | None = None
 
 
 class NotificationTarget(RpcModel):
@@ -794,6 +870,7 @@ RpcResult: TypeAlias = (
     | JobAccepted
     | ConfirmationSummary
     | UpdateStatus
+    | RetirementStatus
     | NotificationConfig
     | ProfileConfigResponse
     | BenchmarkOverview
@@ -909,6 +986,15 @@ __all__ = [
     "BackupSummary",
     "BackupPage",
     "ListAggregateBackups",
+    "GetRetirementStatus",
+    "PrepareRetirement",
+    "ConfirmRetirement",
+    "RetirementConfirmation",
+    "RetirementEntryStatus",
+    "RetirementReconcileEntry",
+    "RetirementStatus",
+    "RetirementPhase",
+    "PayloadAvailability",
     "EventSummary",
     "EventPage",
     "GetStatsSummary",

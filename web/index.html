@@ -71,11 +71,19 @@
         <p class="session-operation" id="session-operation" role="status" aria-live="polite" hidden></p>
         <p class="session-readiness-summary" id="session-readiness-summary">Readiness: waiting for status</p>
         <ol class="session-runway" id="session-runway" aria-label="Server readiness">
-          <li data-session-phase="request" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Request</strong><small>waiting</small></li>
-          <li data-session-phase="process" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Process</strong><small>waiting</small></li>
-          <li data-session-phase="port" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Game port</strong><small>waiting</small></li>
-          <li data-session-phase="ready" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Ready</strong><small>waiting</small></li>
+          <li data-session-phase="request" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Request accepted</strong><small>waiting</small></li>
+          <li data-session-phase="process" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Starting</strong><small>waiting</small></li>
+          <li data-session-phase="ready" data-state="waiting"><span class="runway-mark" aria-hidden="true"></span><strong>Ready to join</strong><small>waiting</small></li>
         </ol>
+        <div class="startup-estimate" id="startup-estimate" hidden>
+          <div class="startup-estimate-head">
+            <span class="eyebrow">Estimated progress</span>
+            <span class="startup-estimate-note" id="startup-estimate-note">Learning startup time… 5 successful starts needed</span>
+          </div>
+          <div class="startup-estimate-track" id="startup-estimate-track" role="progressbar" aria-label="Estimated startup progress" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Learning startup time… 5 successful starts needed">
+            <span class="startup-estimate-fill" id="startup-estimate-fill"></span>
+          </div>
+        </div>
         <div class="session-facts">
           <div class="session-endpoint">
             <span class="eyebrow">join</span>
@@ -349,6 +357,14 @@
               <option value="paper">Paper</option>
             </select>
           </div>
+          <section class="settings-panel startup-estimate-settings" aria-labelledby="startup-estimate-settings-title">
+            <div>
+              <p class="eyebrow">experimental</p>
+              <h2 id="startup-estimate-settings-title">Startup estimate</h2>
+              <p class="field-hint">Shows an estimated startup track on the current session using this controller's recent successful start durations. The setting is stored in this browser only.</p>
+            </div>
+            <label class="check-row" for="startup-estimate-toggle"><input id="startup-estimate-toggle" type="checkbox"> Experimental startup estimate</label>
+          </section>
           <section class="settings-panel performance-panel" id="performance-panel" aria-labelledby="performance-title">
             <div><p class="eyebrow">measure first</p><h2 id="performance-title">Performance</h2><p class="field-hint">Read-only snapshot from the web tier and slot daemon. Loaded when this page opens; no polling.</p></div>
             <h3>Web routes</h3>

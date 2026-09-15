@@ -5,6 +5,7 @@ from pathlib import Path
 import asyncio
 import threading
 import sqlite3
+import time
 from contextlib import suppress
 from types import SimpleNamespace
 
@@ -168,6 +169,11 @@ async def test_build_controller_wires_real_typed_service_seams(monkeypatch, tmp_
     assert controller.services.logs is not None
     assert controller.services.backups is not None
     assert controller.services.updates is not None
+    assert callable(
+        controller.services.updates.services[
+            ProfileId.MINECRAFT_SUNLIT_COBBLEMON.value
+        ].manual_checker
+    )
     assert controller.services.notifications is not None
     assert controller.services.audit is not None
 
@@ -614,6 +620,36 @@ async def test_update_facade_rejects_unavailable_adapter_and_unknown_check():
     with pytest.raises(SafeError) as error:
         await facade.check(SimpleNamespace(profile_id=ProfileId.PZ_RISING))
     assert error.value.code == "profile_not_found"
+
+
+@pytest.mark.asyncio
+async def test_update_facade_keeps_blocking_check_off_the_event_loop():
+    profile = _profile(ProfileId.MINECRAFT_SUNLIT_COBBLEMON, AdapterKind.SYSTEMD)
+
+    class Service:
+        def check(self, _profile):
+            time.sleep(0.1)
+            return SimpleNamespace(available_version="1.1.4-SSV4.1.5")
+
+    facade = _UpdateFacade(
+        {profile.id.value: Service()},
+        {profile.id.value: profile},
+        {},
+    )
+    heartbeats = 0
+
+    async def heartbeat():
+        nonlocal heartbeats
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+            heartbeats += 1
+
+    task = asyncio.create_task(facade.check(SimpleNamespace(profile_id=profile.id)))
+    await heartbeat()
+    result = await task
+
+    assert heartbeats == 10
+    assert result.available_version == "1.1.4-SSV4.1.5"
 
 
 def test_release_digest_flows_through_profile_into_update_service_without_public_leakage():

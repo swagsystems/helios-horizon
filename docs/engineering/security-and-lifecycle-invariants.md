@@ -126,6 +126,18 @@ any worker that can still mutate, records the safe outcome, and releases only
 after that drain. Scheduled and manual backup use the same controller lease
 authority.
 
+A bounded handoff lets the manual Sunlit update run its pre-update protected
+backup under the update reservation it already holds, without acquiring a
+second lease. The updater mints a random capability per reservation, stores
+only its SHA256 in the reservation, and delivers it to the helper over a
+private stdin pipe (never argv, environment, logs, or durable request state).
+The controller accepts the capability only for the Sunlit protected
+`horizon-b2` backup and revalidates the exact live operation/generation/PID
+identity at every publication fence, so it is not a release-and-reacquire and
+actor name is never the authorization. A completed backup from an earlier run
+is reused only when it is bound to the same continuously-held reservation;
+otherwise the updater fails closed rather than promoting on stale evidence.
+
 ## Status truthfulness and benchmark admission
 
 Fresh status and slot observations are evidence; a cold cached projection is

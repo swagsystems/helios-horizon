@@ -8,13 +8,14 @@ is selected by an input string.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import backup_command, capability_issue, deployment_verify, journal_evidence, jvm_args, session_revoke, sunlit_update
+from . import backup_command, capability_issue, deployment_verify, journal_evidence, jvm_args, retirement_command, session_revoke, sunlit_update
 
 
 _UNSAFE_TEXT = re.compile(r"[;&|$`()<>\x00-\x1f]")
@@ -24,6 +25,19 @@ def _pending(_args: argparse.Namespace) -> int:
 
 def _backup(args: argparse.Namespace) -> int:
     return backup_command.reconcile(("--apply",) if args.apply else ())
+
+
+def _retirement(args: argparse.Namespace) -> int:
+    values = [args.retirement_command]
+    if getattr(args, "operation_id", None):
+        values.append(args.operation_id)
+    try:
+        result = retirement_command.run(values)
+    except (retirement_command.RetirementCommandError, ValueError) as exc:
+        print(f"horizon: retirement: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 def _capability(_args: argparse.Namespace) -> int:
@@ -72,13 +86,13 @@ def _sunlit(args: argparse.Namespace) -> int:
 
 def _reject_duplicate_options(argv: Sequence[str]) -> None:
     seen: set[str] = set()
-    value_options = {"--root", "--relay-state"}
+    value_options = {"--root", "--relay-state", "--operation-id"}
     index = 0
     while index < len(argv):
         value = argv[index]
         if value.startswith("--"):
             option = value.split("=", 1)[0]
-            if option in {"--apply", "--static", "--check", "--root", "--relay-state"}:
+            if option in {"--apply", "--static", "--check", "--root", "--relay-state", "--operation-id"}:
                 if option in seen:
                     raise ValueError(f"duplicate option: {option}")
                 seen.add(option)
@@ -104,6 +118,20 @@ def _parser() -> argparse.ArgumentParser:
     reconcile = backup_commands.add_parser("reconcile")
     reconcile.add_argument("--apply", action="store_true")
     reconcile.set_defaults(handler=_backup)
+
+    retirement = commands.add_parser("retirement")
+    retirement_commands = retirement.add_subparsers(dest="retirement_command", required=True)
+    for phase in ("quarantine", "purge", "rollback"):
+        phase_parser = retirement_commands.add_parser(phase)
+        phase_parser.add_argument("operation_id", type=_operation_id)
+        phase_parser.set_defaults(handler=_retirement)
+    status = retirement_commands.add_parser("status")
+    status.add_argument("--operation-id", type=_operation_id)
+    status.set_defaults(handler=_retirement)
+    inspect = retirement_commands.add_parser("inspect")
+    inspect.set_defaults(handler=_retirement)
+    reconcile_retirement = retirement_commands.add_parser("reconcile")
+    reconcile_retirement.set_defaults(handler=_retirement)
 
     capability = commands.add_parser("capability")
     capability_commands = capability.add_subparsers(dest="capability_command", required=True)
@@ -153,6 +181,12 @@ def _invocation_id(value: str) -> str:
     if not re.fullmatch(r"[0-9a-fA-F]{32}", value):
         raise argparse.ArgumentTypeError("invocation ID must be exactly 32 hexadecimal characters")
     return value.lower()
+
+
+def _operation_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("operation id must be exactly 64 lowercase hexadecimal characters")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:

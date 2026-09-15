@@ -10,7 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import asyncio
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -28,6 +28,7 @@ from .protocol import (
     ConfirmUpdate,
     ConfirmWorldClone,
     CreateBackup,
+    ConfirmRetirement,
     ErrorCode,
     GetLogs,
     GetNotificationConfig,
@@ -46,6 +47,8 @@ from .protocol import (
     ListAudit,
     ListBackups,
     ListAggregateBackups,
+    PrepareRetirement,
+    GetRetirementStatus,
     ListEvents,
     LogOptions,
     PageOptions,
@@ -97,6 +100,11 @@ class BackupBody(StrictBody):
 
 class RestoreBody(StrictBody):
     backup_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class RetirementBody(StrictBody):
+    operation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    phase: Literal["quarantine", "purge", "rollback"]
 
 
 class CloneBody(StrictBody):
@@ -207,6 +215,9 @@ ROUTE_ACTIONS: dict[str, type] = {
     "POST /api/v1/profiles/{profile_id}/restore/prepare": PrepareRestore,
     "POST /api/v1/profiles/{profile_id}/restore": PrepareRestore,
     "POST /api/v1/restore/confirm": ConfirmRestore,
+    "GET /api/v1/retirement": GetRetirementStatus,
+    "POST /api/v1/retirement/prepare": PrepareRetirement,
+    "POST /api/v1/retirement/confirm": ConfirmRetirement,
     "POST /api/v1/world-clone/prepare": PrepareWorldClone,
     "POST /api/v1/worlds/clone": PrepareWorldClone,
     "POST /api/v1/world-clone/confirm": ConfirmWorldClone,
@@ -368,6 +379,15 @@ def _action(path: str, method: str, profile_id: ProfileId | None, payload: Mappi
             return PrepareRestore(kind="prepare_restore", profile_id=profile_id, **RestoreBody.model_validate(payload).model_dump())
         if action_type is ConfirmRestore:
             return ConfirmRestore(kind="confirm_restore", **ConfirmBody.model_validate(payload).model_dump())
+        if action_type is GetRetirementStatus:
+            if payload:
+                raise HTTPException(422, "invalid request")
+            operation_id = request.query_params.get("operation_id")
+            return GetRetirementStatus(kind="get_retirement_status", operation_id=operation_id)
+        if action_type is PrepareRetirement:
+            return PrepareRetirement(kind="prepare_retirement", **RetirementBody.model_validate(payload).model_dump())
+        if action_type is ConfirmRetirement:
+            return ConfirmRetirement(kind="confirm_retirement", **ConfirmBody.model_validate(payload).model_dump())
         if action_type is PrepareWorldClone:
             body = CloneBody.model_validate(payload)
             return PrepareWorldClone(kind="prepare_world_clone", **body.model_dump())
@@ -539,6 +559,10 @@ def add_api_routes(
 
     @router.get("/backups")
     async def aggregate_backups(request: Request, response: Response):
+        return await invoke(request, response, profile_id=None, payload={})
+
+    @router.get("/retirement")
+    async def retirement_status(request: Request, response: Response):
         return await invoke(request, response, profile_id=None, payload={})
 
     @router.get("/profiles/{profile_id}/stats/summary")
