@@ -14,8 +14,18 @@ from playwright.sync_api import Page, expect
 from browser_harness import browser_page
 
 
-# Screenshots are private review artifacts and never belong in the public repo.
-ARTIFACTS = Path(os.environ.get("HORIZON_UI_ARTIFACTS", "/root/horizon-overnight-20260914-lITzxz/ui-artifacts"))
+@pytest.fixture
+def artifacts(tmp_path):
+    """Per-test screenshot directory.
+
+    Screenshots are review artifacts, so they land in pytest's isolated
+    temporary directory (or an explicitly configured one) and never in the
+    repository or a host-specific path.
+    """
+    override = os.environ.get("HORIZON_UI_ARTIFACTS")
+    directory = Path(override) if override else tmp_path / "ui-artifacts"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 UPDATE_NOTICE = "Updating… Start is unavailable until the update finishes."
 
@@ -148,7 +158,7 @@ def stopped_status(**overrides) -> dict:
     return {"profiles": [profile("minecraft", **overrides), profile("pz-rising")]}
 
 
-def test_update_reservation_marks_homepage_detail_and_disables_start(update_page: Page):
+def test_update_reservation_marks_homepage_detail_and_disables_start(update_page: Page, artifacts: Path):
     page = update_page
     emit(page, stopped_status(update={
         "source": "reservation",
@@ -162,8 +172,7 @@ def test_update_reservation_marks_homepage_detail_and_disables_start(update_page
     expect(card).to_have_class(re.compile(r"\bstate-updating\b"))
     expect(page.locator("#session-primary")).to_have_text("Updating…")
     expect(page.locator("#session-primary")).to_be_disabled()
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(ARTIFACTS / "update-state-homepage.png"), full_page=True)
+    page.screenshot(path=str(artifacts / "update-state-homepage.png"), full_page=True)
     page.goto(f"{page.url.split('#', 1)[0]}#/servers/minecraft/console")
     expect(page.locator("#detail-status .status-text")).to_have_text("Updating")
     expect(page.locator("#detail-start")).to_be_disabled()
@@ -173,7 +182,7 @@ def test_update_reservation_marks_homepage_detail_and_disables_start(update_page
     # Plain copy only: no backend jargon in the operator-facing text.
     for jargon in ("reservation", "lease", "operation_id", "capability"):
         assert jargon not in note.inner_text().lower()
-    page.screenshot(path=str(ARTIFACTS / "update-state-detail.png"), full_page=True)
+    page.screenshot(path=str(artifacts / "update-state-detail.png"), full_page=True)
 
 
 def test_update_pauses_other_profile_starts_and_switch_dialog(update_page: Page):
@@ -215,7 +224,7 @@ def test_stale_update_reservation_does_not_gray_profile(update_page: Page):
     expect(page.locator("#detail-update-note")).to_be_hidden()
 
 
-def test_stopped_profile_retains_historical_metrics(update_page: Page):
+def test_stopped_profile_retains_historical_metrics(update_page: Page, artifacts: Path):
     page = update_page
     emit(page, stopped_status())
     note = page.locator("#metrics-history-note")
@@ -230,8 +239,7 @@ def test_stopped_profile_retains_historical_metrics(update_page: Page):
     expect(page.locator("#metric-uptime")).to_have_text("Offline")
     expect(page.locator("#metrics-run-note")).to_contain_text("(last observed sample)")
     assert "now" not in page.locator("#metrics-run-note").inner_text().split("→")[-1]
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(ARTIFACTS / "offline-history-metrics.png"), full_page=True)
+    page.screenshot(path=str(artifacts / "offline-history-metrics.png"), full_page=True)
     # History survives tab navigation.
     page.locator("#tab-console").click()
     page.locator("#tab-metrics").click()
@@ -259,7 +267,7 @@ def test_new_run_replaces_historical_view(update_page: Page):
     expect(page.locator("#metric-cpu-current")).not_to_contain_text("historical")
 
 
-def test_cold_stopped_page_shows_recent_history(cold_stopped_page: Page):
+def test_cold_stopped_page_shows_recent_history(cold_stopped_page: Page, artifacts: Path):
     page = cold_stopped_page
     note = page.locator("#metrics-history-note")
     expect(note).to_be_visible(timeout=10000)
@@ -270,8 +278,7 @@ def test_cold_stopped_page_shows_recent_history(cold_stopped_page: Page):
     expect(page.locator("#metric-cpu-current")).to_have_text("12.0% (historical)")
     expect(page.locator("#metric-memory-current")).to_have_text("6.0 GiB (historical)")
     expect(page.locator("#metrics-run-note")).to_contain_text("(last observed sample)")
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(ARTIFACTS / "cold-stopped-recent-history.png"), full_page=True)
+    page.screenshot(path=str(artifacts / "cold-stopped-recent-history.png"), full_page=True)
 
 
 def test_recent_history_ignores_unavailable_points_and_uses_real_last_sample(cold_stopped_page: Page):

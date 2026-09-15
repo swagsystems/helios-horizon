@@ -33,6 +33,72 @@ def _categories(root: Path) -> set[tuple[str, int, str]]:
     return {(item.path, item.line, item.category) for item in boundary.scan_repository(root)}
 
 
+_BROWSER_PREIMAGE_LINE = (
+    'ARTIFACTS = Path(os.environ.get("HORIZON_UI_ARTIFACTS", '
+    '"/root/workspace-example/ui-artifacts"))'
+)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["/root/dev/artifacts", "/home/dev/artifacts", "/Users/dev/artifacts"],
+)
+def test_browser_home_paths_are_rejected(tmp_path: Path, literal: str) -> None:
+    root = _repository(
+        tmp_path, {"tests/browser/test_widget.py": f'OUT = "{literal}/x"\n'}
+    )
+    assert ("tests/browser/test_widget.py", 1, "browser-local-path") in _categories(root)
+
+
+def test_browser_env_default_developer_home_literal_is_rejected(tmp_path: Path) -> None:
+    # The exact shape of the confirmed CI regression: a home path embedded as
+    # the default value of an environment lookup.
+    root = _repository(
+        tmp_path, {"tests/browser/test_update_and_history.py": _BROWSER_PREIMAGE_LINE + "\n"}
+    )
+    assert (
+        "tests/browser/test_update_and_history.py",
+        1,
+        "browser-local-path",
+    ) in _categories(root)
+
+
+def test_browser_line_finding_flags_preimage_without_matched_content(tmp_path: Path) -> None:
+    findings = boundary._line_findings(
+        "tests/browser/test_update_and_history.py", 18, _BROWSER_PREIMAGE_LINE
+    )
+    assert boundary.Finding(
+        "tests/browser/test_update_and_history.py", 18, "browser-local-path"
+    ) in findings
+    # Safe format only: path, line and category; no matched content.
+    rendered = sorted(item.render() for item in findings)
+    assert "tests/browser/test_update_and_history.py:18:browser-local-path" in rendered
+    assert all("workspace-example" not in item for item in rendered)
+
+
+def test_browser_portable_paths_are_allowed(tmp_path: Path) -> None:
+    root = _repository(
+        tmp_path,
+        {
+            "tests/browser/test_widget.py": (
+                'OUT = "artifacts/out"\n'
+                'CACHE = tmp_path / "cache"\n'
+                'SERVED = "/opt/game-control/web/app.js"\n'
+                'HOME_LABEL = "developer-home"\n'
+            )
+        },
+    )
+    assert _categories(root) == set()
+
+
+def test_non_browser_home_path_sentinel_is_not_flagged(tmp_path: Path) -> None:
+    # The deliberate /root/... sentinel outside the browser surface stays as-is.
+    root = _repository(
+        tmp_path, {"tests/test_maintenance_process.py": 'SENTINEL = "/root/secret"\n'}
+    )
+    assert _categories(root) == set()
+
+
 def test_clean_tracked_reference_uses_documentation_networks_and_example_namespaces(tmp_path: Path) -> None:
     root = _repository(
         tmp_path,

@@ -105,17 +105,32 @@ def test_stopped_and_unknown_capacity_do_not_fabricate_history(metrics_page: Pag
     item = page._metrics_status["profiles"][0]
     item.update(state="stopped", pid=None, started_at=None, cpu_percent=None, rss_bytes=None)
     page.reload()
-    page.wait_for_function("document.querySelector('#metrics-run-note').textContent.includes('Server stopped')")
-    assert page.locator('[data-metric="cpu"]').is_visible()
-    # A stopped cold load shows the bounded recent history it actually has,
-    # explicitly labelled, instead of fabricating offline zeros.  Capacity is
-    # still unknown for a stopped profile.
+    # A stopped cold load renders "Server stopped · no active run" only until the
+    # bounded cold history fetch resolves; asserting that transient line races
+    # the route latency, so wait for the settled, truthful history label.
     page.wait_for_function(
-        "document.querySelector('#metrics-history-note').textContent.includes('Recent history · last observed')"
+        """() => {
+          const note = document.querySelector('#metrics-history-note');
+          const text = note ? note.textContent : '';
+          return text.includes('last observed') || text.includes('no usable observations')
+            || text.includes('unavailable right now');
+        }"""
     )
+    assert page.locator('[data-metric="cpu"]').is_visible()
+    # This fixture serves retained history, so the settled view is the labelled
+    # recent view: real last-observed timestamps, no fabricated offline zeros,
+    # and still-unknown capacity for a stopped profile.
+    note = page.locator("#metrics-history-note").inner_text()
+    assert "last observed" in note
+    assert "may include more than one server run" in note
+    run_note = page.locator("#metrics-run-note").inner_text()
+    assert "(last observed sample)" in run_note
+    assert "→ now" not in run_note
     points = page.locator("#metric-cpu-chart .chart-line").get_attribute("points")
     assert points and "NaN" not in points
     assert page.locator("#metric-cpu-current").inner_text() == "12.0% (historical)"
+    assert page.locator("#metric-memory-current").inner_text() == "6.0 GiB (historical)"
+    assert page.locator("#metric-players-current").inner_text() == "Offline"
     assert page.locator("#rail-cpu-capacity").get_attribute("aria-valuenow") is None
     assert "/ 0" not in page.locator("#rail-cpu").inner_text()
 

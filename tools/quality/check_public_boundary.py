@@ -148,6 +148,14 @@ def _is_example_surface(relative: str) -> bool:
     return relative.startswith("config/examples/") or relative.startswith("deploy/example/")
 
 
+BROWSER_TEST_SURFACE = "tests/browser/"
+# Browser tests must stay portable: they may use the pytest ``tmp_path``
+# fixture or repository-relative paths, never an absolute developer-home path.
+# Matches an absolute path whose first segment is a home root and which has at
+# least one further segment (so bare "/root" prose is not flagged).
+BROWSER_LOCAL_PATH = re.compile(r"(?<![A-Za-z0-9_.-])/(?:root|home|Users)/[A-Za-z0-9_.-]")
+
+
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (
         metadata.st_dev,
@@ -243,6 +251,11 @@ def _line_findings(relative: str, line_number: int, line: str) -> set[Finding]:
     for match in PRIVATE_DNS.finditer(line):
         if match.group(0) not in NON_DNS_TOKENS:
             findings.add(Finding(relative, line_number, "private-dns"))
+    if relative.startswith(BROWSER_TEST_SURFACE) and BROWSER_LOCAL_PATH.search(line):
+        # Non-portable hardcoded developer-home path in the browser-test
+        # surface. The matched text is deliberately not included in the
+        # finding, matching the other categories' safe format.
+        findings.add(Finding(relative, line_number, "browser-local-path"))
     if _is_example_surface(relative):
         if FILE_URI.search(line):
             findings.add(Finding(relative, line_number, "example-path-namespace"))

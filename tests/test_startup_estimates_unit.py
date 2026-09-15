@@ -294,8 +294,8 @@ def test_read_side_rejects_corrupt_persisted_rows(tmp_path: Path) -> None:
     )
     connection.execute(
         "INSERT INTO startup_estimate_samples(profile_id, version, duration_ms, finished_at, run_key)"
-        " VALUES ('minecraft', ?, 10_000_000.0, '2026-09-14T12:00:00Z', 'raw-big')",
-        (VERSION,),
+        " VALUES ('minecraft', ?, ?, '2026-09-14T12:00:00Z', 'raw-big')",
+        (VERSION, 10_000_000.0),
     )
     for index in range(5):
         store.record_sample("minecraft", VERSION, 60_000, run_key=f"ok-{index}")
