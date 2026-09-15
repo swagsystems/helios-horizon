@@ -4,6 +4,13 @@ After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/game-control/arm/bore-minecraft
 OnFailure=horizon-alert-notify@bore-minecraft-fenced.service
+# Start immediately after any client exit, including the clean exit the remote
+# relay produces when its control connection drops, and retry a fixed,
+# non-hot interval until the remote returns. The arm marker and an explicit
+# `systemctl stop` remain the intentional-stop authorities: stop is never
+# restarted, and a missing marker makes every later start or auto-restart job a
+# no-op (it does not terminate an already-running client).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,8 +20,8 @@ Environment=BoreRemoteHost=192.0.2.20
 EnvironmentFile=/etc/game-control/secrets.d/bore-minecraft.env
 ExecStartPre=+/usr/bin/sh -c 'test -f /etc/game-control/arm/bore-minecraft && test "$(/usr/bin/stat -c %%u:%%a /etc/game-control/arm/bore-minecraft)" = 0:600'
 ExecStart=/usr/local/bin/bore local 25565 --local-host 127.0.0.1 --to ${BoreRemoteHost} --port 25565
-Restart=no
-RestartSec=0
+Restart=always
+RestartSec=15
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

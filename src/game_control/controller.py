@@ -609,7 +609,13 @@ class Controller:
         try:
             return await self._execute(request)
         finally:
-            self.performance.record_rpc((time.monotonic() - started) * 1000.0)
+            ended = time.monotonic()
+            self.performance.record_rpc(
+                (ended - started) * 1000.0,
+                action=request.action,
+                monotonic_start=started,
+                monotonic_end=ended,
+            )
             if not isinstance(request.action, GetPerf):
                 try:
                     self.performance.flush_if_due(self._db(), now=self._clock())

@@ -312,19 +312,32 @@ def _stats_tps_v2(connection: sqlite3.Connection, profile_id: str, window: str,
         rows = connection.execute(
             """SELECT u.bucket_start_ms,r.metric,u.min,u.max,u.sum,u.count
                FROM telemetry_rollups u JOIN telemetry_series r USING(series_id)
-               WHERE r.profile_id=? AND r.metric IN ('tps','mspt') AND u.bucket_start_ms>=?
+               WHERE r.profile_id=? AND r.metric IN ('tps','mspt')
+                 AND u.bucket_start_ms>=? AND u.bucket_start_ms<=?
                ORDER BY u.bucket_start_ms,r.metric LIMIT 10000""",
-            (profile_id, cutoff_ms),
+            (profile_id, cutoff_ms, now_ms),
         ).fetchall()
         state_rows = connection.execute(
             """SELECT u.bucket_start_ms,r.metric,u.available_ms,u.inactive_ms,u.unavailable_ms,
                       u.available_count,u.inactive_count,u.unavailable_count
                FROM telemetry_state_rollups u JOIN telemetry_series r USING(series_id)
-               WHERE r.profile_id=? AND r.metric IN ('tps','mspt') AND u.bucket_start_ms>=?
+               WHERE r.profile_id=? AND r.metric IN ('tps','mspt')
+                 AND u.bucket_start_ms>=? AND u.bucket_start_ms<=?
                ORDER BY u.bucket_start_ms,r.metric LIMIT 10000""",
-            (profile_id, cutoff_ms),
+            (profile_id, cutoff_ms, now_ms),
         ).fetchall()
         points = _rollup_points(rows, _RESOLUTION_MS[chosen], state_rows)
+        raw_rows = connection.execute(
+            """SELECT x.ts_ms,r.metric,x.value,x.state,r.labels_json
+               FROM telemetry_samples x JOIN telemetry_series r USING(series_id)
+               WHERE r.profile_id=? AND r.metric IN ('tps','mspt')
+                 AND x.ts_ms>=? AND x.ts_ms<=?
+               ORDER BY x.ts_ms,r.metric,r.labels_json LIMIT 100000""",
+            (profile_id, cutoff_ms, now_ms),
+        ).fetchall()
+        points = _merge_points(points, _aggregate_resolution(_raw_points(raw_rows), _RESOLUTION_MS[chosen], end_ms=now_ms))
+        for point in points:
+            point.pop("_metric_counts", None)
     time_basis = _time_basis(points, effective_seconds)
     points, boundaries_truncated = _bounded_stateful(points, limit)
     latest_observation = _latest_v2_observation(connection, profile_id, current)
@@ -335,7 +348,7 @@ def _stats_tps_v2(connection: sqlite3.Connection, profile_id: str, window: str,
         latest_observation["staleness_seconds"] if latest_observation is not None else None
     )
     stale = latest_observation is None or bool(latest_observation["stale"])
-    samples = [{key: value for key, value in item.items() if key != "ts_ms"} for item in points]
+    samples = [{key: value for key, value in item.items() if key not in {"ts_ms", "_metric_counts"}} for item in points]
     return {
         "window": window,
         "resolution": chosen,
@@ -457,11 +470,30 @@ def _raw_points(rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
     return output
 
 
-def _aggregate_resolution(points: list[dict[str, Any]], width_ms: int) -> list[dict[str, Any]]:
+def _aggregate_resolution(points: list[dict[str, Any]], width_ms: int, *, end_ms: int | None = None) -> list[dict[str, Any]]:
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for point in points:
         grouped[(point["ts_ms"] // width_ms) * width_ms].append(point)
-    return [_aggregate_group(ts_ms, group) for ts_ms, group in sorted(grouped.items())]
+    output = []
+    ordered = sorted(points, key=lambda item: item["ts_ms"])
+    following = {id(point): ordered[index + 1]["ts_ms"] if index + 1 < len(ordered) else end_ms
+                 for index, point in enumerate(ordered)}
+    for ts_ms, group in sorted(grouped.items()):
+        item = _aggregate_group(ts_ms, group)
+        durations = {"available": 0.0, "inactive": 0.0, "unavailable": 0.0}
+        for point in group:
+            stop = following[id(point)]
+            if stop is None:
+                continue
+            stop = min(stop, ts_ms + width_ms)
+            if stop > point["ts_ms"]:
+                durations[point["state"]] += (stop - point["ts_ms"]) / 1000.0
+        if any(durations.values()):
+            item["state_duration_seconds"] = durations
+            total = sum(durations.values())
+            item.update({f"{name}_fraction": durations[name] / total for name in durations})
+        output.append(item)
+    return output
 
 
 def _aggregate_group(ts_ms: int, group: list[dict[str, Any]]) -> dict[str, Any]:
@@ -476,11 +508,13 @@ def _aggregate_group(ts_ms: int, group: list[dict[str, Any]]) -> dict[str, Any]:
     result.update({f"{name}_fraction": counts[name] / total_states
                    for name in ("available", "inactive", "unavailable")})
     if available:
+        result["_metric_counts"] = {}
         for metric in ("tps", "mspt"):
             values = [float(item[metric]) for item in available if item[metric] is not None]
             if values:
                 result[metric] = sum(values) / len(values)
                 result[f"{metric}_min"], result[f"{metric}_max"] = min(values), max(values)
+                result["_metric_counts"][metric] = len(values)
     return result
 
 
@@ -503,12 +537,14 @@ def _rollup_points(rows: list[tuple[Any, ...]], width_ms: int,
                 "state": "unavailable", "tps": None, "mspt": None}
         if all(name in metrics for name in ("tps", "mspt")):
             item["state"] = "available"
+            item["_metric_counts"] = {}
             for metric in ("tps", "mspt"):
                 values = metrics[metric]
                 count = sum(value[3] for value in values)
                 item[metric] = sum(value[2] for value in values) / count
                 item[f"{metric}_min"] = min(value[0] for value in values)
                 item[f"{metric}_max"] = max(value[1] for value in values)
+                item["_metric_counts"][metric] = count
         duration = {"available": 0, "inactive": 0, "unavailable": 0}
         for metric_values in states.get(ts_ms, {}).values():
             totals = tuple(sum(value[index] for value in metric_values) for index in range(3))
@@ -524,6 +560,55 @@ def _rollup_points(rows: list[tuple[Any, ...]], width_ms: int,
                 item["state"] = "available"
         output.append(item)
     return output
+
+
+def _merge_points(*point_sets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge rollup/raw buckets with weighted values on the cutoff bucket."""
+    merged: dict[int, dict[str, Any]] = {}
+    for points in point_sets:
+        for point in points:
+            key = int(point["ts_ms"])
+            previous = merged.get(key)
+            if previous is None:
+                merged[key] = point
+                continue
+            counts = dict(previous.get("_metric_counts", {}))
+            incoming_counts = point.get("_metric_counts", {})
+            for metric in ("tps", "mspt", "value"):
+                left_count = counts.get(metric, 0)
+                right_count = incoming_counts.get(metric, 0)
+                left = previous.get(metric)
+                right = point.get(metric)
+                if right is None:
+                    continue
+                if left is None or left_count == 0:
+                    previous[metric] = right
+                    counts[metric] = right_count
+                elif right_count:
+                    previous[metric] = (left * left_count + right * right_count) / (left_count + right_count)
+                    counts[metric] = left_count + right_count
+                for suffix in ("min", "max"):
+                    name = f"{metric}_{suffix}"
+                    incoming_name = name if name in point else (suffix if metric == "value" else name)
+                    if incoming_name in point:
+                        previous[incoming_name] = (min if suffix == "min" else max)(
+                            previous.get(incoming_name, right), point[incoming_name]
+                        )
+            previous["_metric_counts"] = counts
+            if "state_duration_seconds" in point:
+                durations = previous.setdefault("state_duration_seconds", {})
+                for name, value in point["state_duration_seconds"].items():
+                    durations[name] = durations.get(name, 0.0) + float(value)
+                total = sum(durations.values()) or 1.0
+                for name in ("available", "inactive", "unavailable"):
+                    previous[f"{name}_fraction"] = durations.get(name, 0.0) / total
+            for name in ("available", "inactive", "unavailable"):
+                fraction = f"{name}_fraction"
+                if fraction in point and fraction not in previous:
+                    previous[fraction] = point[fraction]
+            if previous.get("state") != "available" and point.get("state") == "available":
+                previous["state"] = "available"
+    return [merged[key] for key in sorted(merged)]
 
 
 def _bounded_stateful(points: list[dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], bool]:
@@ -620,21 +705,32 @@ def _timeline_context(telemetry: sqlite3.Connection, state: sqlite3.Connection, 
                        "value": None if value is None else float(value), "state": str(sample_state)}
                       for ts, value, sample_state in rows]
             if width_ms:
-                points = _aggregate_scalar(points, width_ms)
+                points = _aggregate_scalar(points, width_ms, end_ms=now_ms)
         else:
             rows = telemetry.execute(
                 """SELECT u.bucket_start_ms,u.min,u.max,u.sum,u.count FROM telemetry_rollups u
                    JOIN telemetry_series r USING(series_id)
-                   WHERE r.profile_id=? AND r.metric=? AND u.bucket_start_ms>=? AND u.bucket_start_ms<=?
+                 WHERE r.profile_id=? AND r.metric=? AND u.bucket_start_ms>=? AND u.bucket_start_ms<=?
                    ORDER BY u.bucket_start_ms LIMIT 10000""",
                 (profile_id, metric, cutoff_ms, now_ms),
             ).fetchall()
             points = [{"ts_ms": int(ts), "ts": _iso(datetime.fromtimestamp(int(ts) / 1000, timezone.utc)),
                        "value": float(total) / int(count), "min": float(minimum), "max": float(maximum),
-                       "state": "available"}
+                       "state": "available", "_metric_counts": {"value": int(count)}}
                       for ts, minimum, maximum, total, count in rows if int(count) > 0]
+            raw_rows = telemetry.execute(
+                """SELECT x.ts_ms,x.value,x.state FROM telemetry_samples x
+                   JOIN telemetry_series r USING(series_id)
+                   WHERE r.profile_id=? AND r.metric=? AND x.ts_ms>=? AND x.ts_ms<=?
+                   ORDER BY x.ts_ms LIMIT 100000""",
+                (profile_id, metric, cutoff_ms, now_ms),
+            ).fetchall()
+            raw_points = [{"ts_ms": int(ts), "ts": _iso(datetime.fromtimestamp(int(ts) / 1000, timezone.utc)),
+                           "value": None if value is None else float(value), "state": str(sample_state)}
+                          for ts, value, sample_state in raw_rows]
+            points = _merge_points(points, _aggregate_scalar(raw_points, _RESOLUTION_MS[resolution], end_ms=now_ms))
         bounded, _ = _bounded_scalar(points, min(limit, 720))
-        series[metric] = [{key: value for key, value in point.items() if key != "ts_ms"} for point in bounded]
+        series[metric] = [{key: value for key, value in point.items() if key not in {"ts_ms", "_metric_counts"}} for point in bounded]
     jobs: list[dict[str, Any]] = []
     try:
         rows = state.execute(
@@ -759,11 +855,14 @@ def _benchmark_comparison(state: sqlite3.Connection, profile_id: str) -> dict[st
             "candidate_preset": candidate, "verdict": verdict, "metrics": metrics}
 
 
-def _aggregate_scalar(points: list[dict[str, Any]], width_ms: int) -> list[dict[str, Any]]:
+def _aggregate_scalar(points: list[dict[str, Any]], width_ms: int, *, end_ms: int | None = None) -> list[dict[str, Any]]:
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for point in points:
         grouped[(point["ts_ms"] // width_ms) * width_ms].append(point)
     output = []
+    ordered = sorted(points, key=lambda item: item["ts_ms"])
+    following = {id(point): ordered[index + 1]["ts_ms"] if index + 1 < len(ordered) else end_ms
+                 for index, point in enumerate(ordered)}
     for ts_ms, group in sorted(grouped.items()):
         available = [point for point in group if point["state"] == "available" and point["value"] is not None]
         states = {point["state"] for point in group}
@@ -772,7 +871,20 @@ def _aggregate_scalar(points: list[dict[str, Any]], width_ms: int) -> list[dict[
                 "value": None, "state": state}
         if available:
             values = [float(point["value"]) for point in available]
-            item.update(value=sum(values) / len(values), min=min(values), max=max(values))
+            item.update(value=sum(values) / len(values), min=min(values), max=max(values),
+                        _metric_counts={"value": len(values)})
+        durations = {"available": 0.0, "inactive": 0.0, "unavailable": 0.0}
+        for point in group:
+            stop = following[id(point)]
+            if stop is None:
+                continue
+            stop = min(stop, ts_ms + width_ms)
+            if stop > point["ts_ms"]:
+                durations[point["state"]] += (stop - point["ts_ms"]) / 1000.0
+        if any(durations.values()):
+            item["state_duration_seconds"] = durations
+            total = sum(durations.values())
+            item.update({f"{name}_fraction": durations[name] / total for name in durations})
         output.append(item)
     return output
 

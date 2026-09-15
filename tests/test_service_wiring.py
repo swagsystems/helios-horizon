@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import asyncio
+import os
 import threading
 import sqlite3
 import time
 from contextlib import suppress
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -29,6 +31,7 @@ from game_control.protocol import (
     ListEvents,
     LogOptions,
     PageOptions,
+    RpcRequest,
     TestNotification as _NotificationAction,
 )
 from game_control.redaction import Redactor, SecretRegistry
@@ -44,6 +47,7 @@ from game_control.service_wiring import (
     _ProfilesFacade,
     _StatusFacade,
 )
+from game_control.slot import ReservationStore
 from game_control.status import StatusService
 from game_control.state_db import StateDatabase
 from game_control.telemetry_db import TelemetryDatabase
@@ -188,6 +192,55 @@ async def test_build_controller_wires_real_typed_service_seams(monkeypatch, tmp_
     supplied = SimpleNamespace(pid=123)
     monkeypatch.setattr(wiring.MetricSampler, "sample", lambda *_args, **_kwargs: pytest.fail("resampled"))
     assert checker.process_checker(profiles[0], SimpleNamespace(pid=123), process_metrics=supplied) is True
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="reservation writes require root")
+@pytest.mark.asyncio
+async def test_status_rpc_projects_live_update_reservation_through_real_controller(monkeypatch, tmp_path):
+    profiles = [_profile(ProfileId.MINECRAFT, AdapterKind.SYSTEMD)]
+    registry = _Registry(profiles)
+    monkeypatch.setattr(slotd_main, "ProfileRegistry", SimpleNamespace(load=lambda path: registry))
+    monkeypatch.setattr(slotd_main, "StateDatabase", SimpleNamespace(open=lambda path: _State()))
+    monkeypatch.setattr(
+        slotd_main,
+        "SlotInspector",
+        lambda: SimpleNamespace(observe=lambda: SimpleNamespace(owner=None, inconsistent=False)),
+    )
+    operation = tmp_path / "operation.lock"
+    operation.touch()
+    store = ReservationStore(operation_path=operation, reservation_path=tmp_path / "reservation.json")
+    monkeypatch.setattr(slotd_main, "ReservationStore", lambda reservation_path: store)
+    config = tmp_path / "controller.toml"
+    config.write_text("[crafty]\nbase_url='https://127.0.0.1:8443'\ntoken_path='/dev/null'\n")
+
+    assembly = await slotd_main.build_controller_assembly(config)
+    controller = assembly.controller
+
+    async def status_rpc():
+        response = await controller.execute(
+            RpcRequest(
+                request_id=uuid4(),
+                actor="swag",
+                action=GetStatus(kind="get_status"),
+            )
+        )
+        assert response.ok, response.error
+        return next(item for item in response.result.profiles if item.profile_id is ProfileId.MINECRAFT)
+
+    assert (await status_rpc()).update is None
+    reservation = store.reserve_if_available(
+        ProfileId.MINECRAFT.value, "update-op-1", 10.0, operation_kind="update",
+    )
+    during = await status_rpc()
+    assert during.update is not None
+    assert during.update.source == "reservation"
+    assert during.update.operation_id == "update-op-1"
+    assert during.update.expires_at is not None
+    # A released reservation is gone from the very next RPC projection.
+    assert store.release_if_owned(
+        ProfileId.MINECRAFT.value, "update-op-1", reservation.state_generation, operation_kind="update",
+    )
+    assert (await status_rpc()).update is None
 
 
 @pytest.mark.asyncio

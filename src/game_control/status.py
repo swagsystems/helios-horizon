@@ -16,7 +16,18 @@ from .adapters.crafty import parse_version_text
 from .benchmark_safety import BenchmarkPreflight
 from .models import HealthState, ObservedState
 from .introspection import signature_parameters
-from .protocol import ProfileStatus, StatusSnapshot
+from .protocol import ProfileStatus, StatusSnapshot, UpdateActivity
+
+
+def _expiry_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 # Slotd owns telemetry cadence separately from its 30-second maintenance tick.
@@ -82,6 +93,7 @@ class StatusService:
         ups_health: Callable[[], bool] | None = None,
         benchmark_safety: BenchmarkPreflight | None = None,
         storage_paths: Iterable[str] = ("/srv/game-servers", "/var/lib/game-control"),
+        update_reservations: Callable[[Any], Any] | None = None,
     ):
         self.profiles = tuple(profiles)
         self.adapters = adapters or {}
@@ -114,6 +126,9 @@ class StatusService:
             clock=self.clock,
         )
         self.storage_paths = tuple(storage_paths)
+        # Root-owned projection of the live updater handoff reservation.  A
+        # missing provider simply means "no reservation evidence".
+        self.update_reservations = update_reservations
         # Production maintenance is fixed at a 30-second target. Keep this
         # contract non-configurable so callers cannot create 60-second aliasing
         # or intervals outside the documented 20–45 second envelope.
@@ -198,14 +213,15 @@ class StatusService:
             (getattr(profile, "id"), getattr(getattr(profile, "id"), "value", getattr(profile, "id")))
             for profile in self.profiles
         )
-        jobs = tuple(self._safe_job_for(profile_id, key) for profile_id, key in profile_keys)
+        raw_jobs = tuple(self._raw_job_for(profile_id, key) for profile_id, key in profile_keys)
+        jobs = tuple(job if job in {"start", "stop", "failed"} else None for job in raw_jobs)
         versions = tuple(
             parse_version_text(value) if isinstance(value := getattr(profile, "installed_version", None), str) and value else None
             for profile in self.profiles
         )
         profiles = tuple(
             ProfileStatus(
-                profile_id=getattr(profile, "id"),
+                profile_id=profile_id,
                 state=derive_state(active_job=job, process_alive=False, conflicting_slot_owner=False),
                 health=HealthState.UNKNOWN, slot_owner=None,
                 active_job_id=job,
@@ -213,17 +229,50 @@ class StatusService:
                 rss_bytes=None, players_online=None,
                 installed_version=version,
                 restart_required=False, required_ports_ready=False,
+                update=self._update_activity(profile_id, key, raw_job),
             )
-            for profile, version, (_profile_id, _key), job in zip(self.profiles, versions, profile_keys, jobs)
+            for version, (profile_id, key), job, raw_job in zip(
+                versions, profile_keys, jobs, raw_jobs
+            )
         )
         return StatusSnapshot(generation=int(generation), observed_at=now, profiles=profiles)
 
     def _safe_job_for(self, profile_id: Any, key: Any) -> str | None:
+        value = self._raw_job_for(profile_id, key)
+        return value if value in {"start", "stop", "failed"} else None
+
+    def _raw_job_for(self, profile_id: Any, key: Any) -> str | None:
+        """Fail-safe raw job read: an unreadable job table never breaks status."""
         try:
             value = self._job_for(profile_id, key)
         except Exception:
             return None
-        return value if value in {"start", "stop", "failed"} else None
+        return value if isinstance(value, str) and value else None
+
+    def _update_activity(self, profile_id: Any, key: Any, job: str | None) -> UpdateActivity | None:
+        """Project authoritative update activity from root-owned records.
+
+        The live updater reservation (``operation_kind="update"``) wins because
+        it carries the operation id and expiry.  An accepted/running controller
+        job whose operation is ``update`` is the fallback.  Backup, benchmark or
+        lifecycle jobs never produce an update record.
+        """
+        provider = self.update_reservations
+        if provider is not None:
+            try:
+                reservation = provider(profile_id)
+            except Exception:
+                reservation = None
+            if reservation is not None and getattr(reservation, "operation_kind", None) == "update":
+                operation_id = getattr(reservation, "operation_id", None)
+                return UpdateActivity(
+                    source="reservation",
+                    operation_id=operation_id if isinstance(operation_id, str) and operation_id else None,
+                    expires_at=_expiry_datetime(getattr(reservation, "expires_at", None)),
+                )
+        if job == "update":
+            return UpdateActivity(source="job")
+        return None
 
     def _overlay_active_jobs(self, snapshot: StatusSnapshot) -> StatusSnapshot:
         """Project accepted/running lifecycle intent without external probes."""
@@ -231,7 +280,12 @@ class StatusService:
         changed = False
         for status in snapshot.profiles:
             key = getattr(status.profile_id, "value", status.profile_id)
+            raw_job = self._raw_job_for(status.profile_id, key)
             job = self._safe_job_for(status.profile_id, key)
+            update = self._update_activity(status.profile_id, key, raw_job)
+            if update != status.update:
+                status = status.model_copy(update={"update": update})
+                changed = True
             if job is None:
                 profiles.append(status)
                 continue
@@ -277,7 +331,7 @@ class StatusService:
         for profile in self.profiles:
             profile_id = getattr(profile, "id", None)
             key = getattr(profile_id, "value", profile_id)
-            job = self._job_for(profile_id, key)
+            job = self._raw_job_for(profile_id, key)
             full_probe = (
                 self.slot_observer is None
                 or job is not None
@@ -325,6 +379,7 @@ class StatusService:
                         disk_free_bytes=getattr(cached_disk, "profile_data_free_bytes", None),
                         disk_read_bps=None,
                         disk_write_bps=None,
+                        update=self._update_activity(profile_id, key, job),
                     )
                 )
                 if persist:
@@ -459,6 +514,7 @@ class StatusService:
                     disk_free_bytes=getattr(getattr(sampled, "disk", None), "profile_data_free_bytes", None),
                     disk_read_bps=getattr(sampled, "disk_read_bps", None),
                     disk_write_bps=getattr(sampled, "disk_write_bps", None),
+                    update=self._update_activity(profile_id, key, job),
                 )
             )
         generation = self.generation() if callable(self.generation) else self.generation

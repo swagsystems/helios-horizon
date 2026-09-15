@@ -68,6 +68,35 @@ A slot conflict becomes `already_active` only after a fresh status proves the
 fixed target owns the slot and is starting or running. An unrelated owner,
 stale state, failed verification, or an untyped response remains a failure.
 
+## Fenced public relay recovery
+
+The public relay client is a fenced unit, not the game lifecycle. It runs only
+while the root-owned arm marker exists, refuses to start when the marker is
+absent or has drifted from its expected owner and mode, and is never enabled
+at boot. The client carries `Restart=always`, so an unexpected exit -- including
+the clean exit a remote relay produces when its control connection drops or
+its host reboots -- is restarted by systemd. `RestartSec` paces the retries so
+a long remote outage stays a bounded, non-hot loop, and the start rate limit
+is disabled so that outage cannot strand the unit in a failed state that
+requires an operator to reset it.
+
+Intentional stops stay intentional:
+
+- `systemctl stop`, and `systemctl disable --now` (which stops as well as
+  disables), are honored; systemd never restarts a unit after an explicit stop
+  request. `systemctl disable` on its own does not stop a running client, and
+  because this unit ships no `[Install]` section it has no enablement state to
+  change either way.
+- Removing the arm marker gates later starts: every subsequent start or
+  auto-restart job is skipped because the start condition no longer holds. It
+  disarms the relay without terminating a client that is already running.
+- Stopping the game backend or its local wake proxy is a separate, intended
+  state. The liveness check skips rather than restarting the client whenever
+  the local proxy is inactive, and no timer path starts an inactive client.
+- The liveness timer keeps its own half-open recovery, ownership proof, arm
+  fence, failure threshold, and restart cooldown; it only restarts a client
+  that is already active.
+
 ## Fixed backup reconciliation
 
 The reconciliation command accepts no caller-supplied profile, remote, prefix,

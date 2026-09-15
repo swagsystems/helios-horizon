@@ -30,6 +30,19 @@ RETAINED_PROFILES = frozenset(
     {"minecraft-sunlit-cobblemon", "terraria-vanilla", "terraria-tmod"}
 )
 LEGACY_PROFILES = frozenset({"minecraft", "pz-rising"})
+
+# Bounded, disposable *projection* table created idempotently on the live
+# controller connection (`state_db.ensure_additive_state_tables`). It is not
+# historical authority: the migration intentionally omits it, and the table
+# simply relearns from future observations -- earlier training rows are not
+# reconstructed or replayed. It is ignored rather than refusing the database.
+#
+# The `backup_payload_retirement` ledger is deliberately NOT in this set: it is
+# a safety ledger with terminal states, it is part of the canonical schema
+# below, and every row must survive the migration. Anything else is still a
+# hard fail-closed error.
+ADDITIVE_FEATURE_TABLES = frozenset({"startup_estimate_samples"})
+LEDGER_TABLE = "backup_payload_retirement"
 WRITER_MARKERS = (
     "game_control.controller",
     "game_control.slotd_main",
@@ -196,6 +209,31 @@ EXPECTED_TABLE_SQL = {
         stage TEXT NOT NULL DEFAULT 'prepared',
         progress INTEGER NOT NULL DEFAULT 0
     )""",
+    # Safety ledger: typed retirement state per local backup payload.  Its rows
+    # are provenance for destructive operations and must never be dropped,
+    # recreated empty, or filtered by the offline migration.
+    "backup_payload_retirement": """CREATE TABLE backup_payload_retirement (
+        operation_id TEXT NOT NULL,
+        backup_id TEXT NOT NULL REFERENCES backups(id) ON DELETE RESTRICT,
+        profile_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+            'prepared', 'quarantined', 'purge_prepared', 'purged',
+            'rolled_back', 'failed', 'ambiguous'
+        )),
+        path TEXT NOT NULL,
+        quarantine_path TEXT,
+        expected_device INTEGER NOT NULL,
+        expected_inode INTEGER NOT NULL,
+        expected_size INTEGER NOT NULL,
+        expected_mtime_ns INTEGER NOT NULL,
+        expected_ctime_ns INTEGER NOT NULL,
+        expected_sha256 TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(created_at) = 1),
+        updated_at TEXT NOT NULL CHECK (is_rfc3339_timestamp(updated_at) = 1),
+        error_code TEXT,
+        PRIMARY KEY (operation_id, backup_id)
+    )""",
 }
 EXPECTED_COLUMNS = {
     "events": [("id", "TEXT", 0, None, 1), ("timestamp", "TEXT", 1, None, 0), ("profile_id", "TEXT", 0, None, 0), ("code", "TEXT", 1, None, 0), ("message", "TEXT", 1, None, 0)],
@@ -211,6 +249,7 @@ EXPECTED_COLUMNS = {
     "player_sessions": [("id", "TEXT", 0, None, 1), ("profile_id", "TEXT", 1, None, 0), ("player", "TEXT", 1, None, 0), ("started_at", "TEXT", 1, None, 0), ("ended_at", "TEXT", 0, None, 0), ("source", "TEXT", 1, None, 0)],
     "metric_samples": [("profile_id", "TEXT", 1, None, 0), ("metric", "TEXT", 1, None, 0), ("ts", "TEXT", 1, None, 0), ("value", "REAL", 1, None, 0)],
     "benchmark_runs": [("id", "TEXT", 0, None, 1), ("profile_id", "TEXT", 1, None, 0), ("baseline_preset", "TEXT", 1, None, 0), ("candidate_preset", "TEXT", 1, None, 0), ("state", "TEXT", 1, None, 0), ("created_at", "TEXT", 1, None, 0), ("finished_at", "TEXT", 0, None, 0), ("overall_verdict", "TEXT", 0, None, 0), ("summary_json", "TEXT", 0, None, 0), ("artifact_path", "TEXT", 0, None, 0), ("artifact_sha256", "TEXT", 0, None, 0), ("error_code", "TEXT", 0, None, 0), ("provenance_json", "TEXT", 0, None, 0), ("planned_pairs", "INTEGER", 1, "0", 0), ("completed_pairs", "INTEGER", 1, "0", 0), ("primary_endpoints_json", "TEXT", 0, None, 0), ("thresholds_json", "TEXT", 0, None, 0), ("driver_verdict", "TEXT", 0, None, 0), ("failure_category", "TEXT", 1, "'none'", 0), ("stage", "TEXT", 1, "'prepared'", 0), ("progress", "INTEGER", 1, "0", 0)],
+    "backup_payload_retirement": [("operation_id", "TEXT", 1, None, 1), ("backup_id", "TEXT", 1, None, 2), ("profile_id", "TEXT", 1, None, 0), ("state", "TEXT", 1, None, 0), ("path", "TEXT", 1, None, 0), ("quarantine_path", "TEXT", 0, None, 0), ("expected_device", "INTEGER", 1, None, 0), ("expected_inode", "INTEGER", 1, None, 0), ("expected_size", "INTEGER", 1, None, 0), ("expected_mtime_ns", "INTEGER", 1, None, 0), ("expected_ctime_ns", "INTEGER", 1, None, 0), ("expected_sha256", "TEXT", 1, None, 0), ("manifest_sha256", "TEXT", 1, None, 0), ("created_at", "TEXT", 1, None, 0), ("updated_at", "TEXT", 1, None, 0), ("error_code", "TEXT", 0, None, 0)],
 }
 EXPECTED_INDEXES = {
     "idx_events_history_cursor": ("events", ("timestamp", "id")),
@@ -219,6 +258,7 @@ EXPECTED_INDEXES = {
     "idx_metric_samples": ("metric_samples", ("profile_id", "metric", "ts")),
     "idx_backup_protections_scope": ("backup_protections", ("profile_id", "destination_id", "backup_class", "remote_verified", "comparison_state")),
     "idx_benchmark_runs_profile": ("benchmark_runs", ("profile_id", "created_at")),
+    "idx_backup_payload_retirement_backup": ("backup_payload_retirement", ("backup_id", "state")),
 }
 EXPECTED_TRIGGERS = {
     "events_append_only_update",
@@ -234,6 +274,7 @@ EXPECTED_INDEX_SQL = {
     "idx_metric_samples": "CREATE INDEX idx_metric_samples ON metric_samples(profile_id, metric, ts)",
     "idx_backup_protections_scope": "CREATE INDEX idx_backup_protections_scope ON backup_protections(profile_id, destination_id, backup_class, remote_verified, comparison_state)",
     "idx_benchmark_runs_profile": "CREATE INDEX idx_benchmark_runs_profile ON benchmark_runs(profile_id, created_at DESC)",
+    "idx_backup_payload_retirement_backup": "CREATE INDEX idx_backup_payload_retirement_backup ON backup_payload_retirement(backup_id, state)",
 }
 EXPECTED_TRIGGER_SQL = {
     "events_append_only_update": "CREATE TRIGGER events_append_only_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END",
@@ -243,6 +284,7 @@ EXPECTED_TRIGGER_SQL = {
 }
 EXPECTED_FOREIGN_KEYS = {
     "backup_protections": [("backups", "backup_id", "id", "NO ACTION", "RESTRICT", "NONE")],
+    "backup_payload_retirement": [("backups", "backup_id", "id", "NO ACTION", "RESTRICT", "NONE")],
 }
 
 # The deployed pre-B2 database is one exact schema, not a collection of
@@ -301,11 +343,19 @@ LEGACY_BENCHMARK_TABLE_SQL = """CREATE TABLE benchmark_runs (
 # then error_code models that exact live schema instead of accidentally
 # expecting the post-v4 column in the legacy source.
 LEGACY_BENCHMARK_COLUMNS = EXPECTED_COLUMNS["benchmark_runs"][:10] + EXPECTED_COLUMNS["benchmark_runs"][11:12]
-PRE_BENCHMARK_SOURCE_TABLES = frozenset(EXPECTED_TABLE_SQL) - {"benchmark_runs"}
-PRE_BENCHMARK_SOURCE_INDEXES = frozenset(EXPECTED_INDEXES) - {"idx_benchmark_runs_profile"}
+# The pre-B2 schemas predate the retirement ledger, so it is excluded from the
+# legacy fingerprints.  A legacy source therefore still matches, and a source
+# that already carries the ledger is treated as the current schema instead.
+PRE_BENCHMARK_SOURCE_TABLES = frozenset(EXPECTED_TABLE_SQL) - {"benchmark_runs", LEDGER_TABLE}
+PRE_BENCHMARK_SOURCE_INDEXES = frozenset(EXPECTED_INDEXES) - {"idx_benchmark_runs_profile", "idx_backup_payload_retirement_backup"}
 LEGACY_SOURCE_TABLES = PRE_BENCHMARK_SOURCE_TABLES - {"backup_protections"}
 LEGACY_SOURCE_INDEXES = PRE_BENCHMARK_SOURCE_INDEXES - {"idx_backup_protections_scope"}
-LEGACY_BENCHMARK_TABLES = frozenset(EXPECTED_TABLE_SQL)
+# Clean schema-4 databases written before the retirement ledger existed carry
+# the current ``benchmark_runs`` table but no ledger, so the ledger must be
+# excluded from the pre-ledger fingerprints.  ``LEGACY_BENCHMARK_TABLES`` is
+# the same table set with the older schema-3 ``benchmark_runs`` shape.
+SCHEMA4_PRE_LEDGER_TABLES = frozenset(EXPECTED_TABLE_SQL) - {LEDGER_TABLE}
+LEGACY_BENCHMARK_TABLES = SCHEMA4_PRE_LEDGER_TABLES
 
 
 def _sha256(path: Path) -> tuple[str, int]:
@@ -427,9 +477,17 @@ def _quick_check(connection: sqlite3.Connection, label: str) -> str:
 
 
 def _schema_snapshot(connection: sqlite3.Connection, *, target: bool = False) -> dict[str, Any]:
-    objects = connection.execute(
-        "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    rows = connection.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
     ).fetchall()
+    # Drop additive feature tables (and their indexes/triggers) so the exact
+    # canonical table set is still enforced for everything else.
+    objects = [
+        (kind, name, sql)
+        for kind, name, parent, sql in rows
+        if parent not in ADDITIVE_FEATURE_TABLES
+    ]
     tables = {name: sql for kind, name, sql in objects if kind == "table"}
     table_names = set(tables)
     if target:
@@ -459,9 +517,23 @@ def _schema_snapshot(connection: sqlite3.Connection, *, target: bool = False) ->
         expected_sql["benchmark_runs"] = LEGACY_BENCHMARK_TABLE_SQL
         expected_columns = dict(EXPECTED_COLUMNS)
         expected_columns["benchmark_runs"] = LEGACY_BENCHMARK_COLUMNS
-        expected_indexes = frozenset(EXPECTED_INDEXES)
-        expected_foreign_keys = EXPECTED_FOREIGN_KEYS
+        expected_indexes = frozenset(EXPECTED_INDEXES) - {"idx_backup_payload_retirement_backup"}
+        expected_foreign_keys = {
+            table: keys for table, keys in EXPECTED_FOREIGN_KEYS.items() if table != LEDGER_TABLE
+        }
         expected_version = 3
+    elif table_names == SCHEMA4_PRE_LEDGER_TABLES:
+        # Clean schema-4 database written before the retirement ledger existed.
+        # It is accepted exactly (no unknown tables tolerated) and the target
+        # gains the canonical, empty safety ledger.
+        expected_tables = SCHEMA4_PRE_LEDGER_TABLES
+        expected_sql = EXPECTED_TABLE_SQL
+        expected_columns = EXPECTED_COLUMNS
+        expected_indexes = frozenset(EXPECTED_INDEXES) - {"idx_backup_payload_retirement_backup"}
+        expected_foreign_keys = {
+            table: keys for table, keys in EXPECTED_FOREIGN_KEYS.items() if table != LEDGER_TABLE
+        }
+        expected_version = SCHEMA_VERSION
     elif table_names == frozenset(EXPECTED_TABLE_SQL):
         expected_tables = frozenset(EXPECTED_TABLE_SQL)
         expected_sql = EXPECTED_TABLE_SQL
@@ -766,6 +838,8 @@ def _create_target(
             "player_sessions",
             "metric_samples",
             "benchmark_runs",
+            # Safety ledger: created last and always preserved row-for-row.
+            LEDGER_TABLE,
         ]
         for table in table_order:
             connection.execute(EXPECTED_TABLE_SQL[table])

@@ -228,6 +228,31 @@ def test_reservation_renewal_requires_matching_owner(slot_env):
         slot_env.store.renew_if_owned("pz-rising", "switch-1", ttl=20, state_generation=2)
 
 
+def test_reservation_store_has_no_unfenced_renew_alias(slot_env):
+    # ``renew`` used to alias the unfenced ``reserve`` writer, which overwrites
+    # any live lease. The only renewal entry point must be the ownership-fenced
+    # ``renew_if_owned``.
+    assert not hasattr(slot_env.store, "renew")
+    assert callable(slot_env.store.renew_if_owned)
+
+
+def test_missing_or_stale_owner_cannot_renew(slot_env, monkeypatch):
+    # No reservation at all: nothing may be claimed by "renewal".
+    with pytest.raises(BlockingIOError):
+        slot_env.store.renew_if_owned("minecraft", "switch-1", ttl=20, state_generation=2)
+    assert slot_env.store.read() is None
+    # A live lease owned by another operation/generation is never renewable,
+    # and the live lease must survive the refused attempt unchanged.
+    slot_env.store.reserve("minecraft", "switch-1", ttl=10, state_generation=2)
+    with pytest.raises(BlockingIOError):
+        slot_env.store.renew_if_owned("minecraft", "switch-other", ttl=20, state_generation=2)
+    with pytest.raises(BlockingIOError):
+        slot_env.store.renew_if_owned("minecraft", "switch-1", ttl=20, state_generation=99)
+    current = slot_env.store.read()
+    assert current.operation_id == "switch-1"
+    assert current.state_generation == 2
+
+
 def test_same_profile_different_operation_cannot_replace_live_lease(slot_env):
     slot_env.store.reserve("minecraft", "op-1", ttl=10)
     with pytest.raises(BlockingIOError):
@@ -326,6 +351,46 @@ def test_update_reservation_is_not_runner_authorization(slot_env):
     with slot_module.operation_transaction(slot_env.operation_path):
         assert slot_env.store.owns_live_locked("minecraft", "update-1")
     assert slot_env.store.valid_for_runner("minecraft") is False
+
+
+def test_live_update_reports_only_the_live_updater_reservation(slot_env):
+    reservation = slot_env.store.reserve_if_available(
+        "minecraft", "update-live", ttl=10, operation_kind="update",
+    )
+    assert slot_env.store.live_update("minecraft") == reservation
+    assert slot_env.store.live_update() == reservation
+    # A different profile never inherits another profile's update.
+    assert slot_env.store.live_update("pz-rising") is None
+
+
+def test_live_update_ignores_lifecycle_reservations(slot_env):
+    slot_env.store.reserve("minecraft", "lifecycle-live", ttl=10)
+    assert slot_env.store.live_update("minecraft") is None
+    assert slot_env.store.live_update() is None
+
+
+def test_live_update_treats_expired_and_dead_owner_as_absent(slot_env):
+    slot_env.store.reserve_if_available(
+        "minecraft", "update-dead", ttl=10,
+        controller_pid=999999,
+        controller_start_ticks=1,
+        operation_kind="update",
+    )
+    assert slot_env.store.live_update("minecraft") is None
+    slot_env.reservation_path.write_text(
+        json.dumps(
+            {
+                "profile_id": "minecraft",
+                "operation_id": "update-expired",
+                "state_generation": 1,
+                "controller_pid": os.getpid(),
+                "controller_start_ticks": slot_module.proc_start_ticks(os.getpid()),
+                "operation_kind": "update",
+                "expires_at": 0,
+            }
+        )
+    )
+    assert slot_env.store.live_update("minecraft") is None
 
 
 def test_expected_operation_kind_prevents_same_id_lifecycle_confusion(slot_env):

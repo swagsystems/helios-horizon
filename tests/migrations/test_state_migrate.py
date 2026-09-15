@@ -59,6 +59,173 @@ def no_test_process_is_a_writer(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(migration, "_writer_processes", lambda: [])
 
 
+def _seed_ledger(connection: sqlite3.Connection, rows) -> None:
+    connection.executemany(
+        "INSERT INTO backup_payload_retirement (operation_id, backup_id, profile_id, state,"
+        " path, quarantine_path, expected_device, expected_inode, expected_size,"
+        " expected_mtime_ns, expected_ctime_ns, expected_sha256, manifest_sha256,"
+        " created_at, updated_at, error_code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+
+
+def test_terminal_retirement_ledger_is_preserved_row_for_row(tmp_path: Path):
+    """A nonempty terminal ledger must survive migration byte-for-byte."""
+    source, target, report, retired = paths(tmp_path)
+    make_db(source)
+    connection = sqlite3.connect(source)
+    state_db._configure(connection)
+    connection.execute("INSERT INTO backups VALUES (?,?,?,?,?,?)", ("b1", "terraria-tmod", TS, 10, 1, 1))
+    rows = [
+        ("op-purged", "b1", "terraria-tmod", "purged",
+         "/var/backups/game-servers/terraria-tmod/b1.tar.zst", None,
+         2049, 4242, 10, 1, 2, "c" * 64, "d" * 64, TS, TS, None),
+        ("op-rolled", "b1", "terraria-tmod", "rolled_back",
+         "/var/backups/game-servers/terraria-tmod/b1.tar.zst",
+         "/var/lib/game-control/quarantine/b1", 2049, 4242, 10, 1, 2,
+         "c" * 64, "d" * 64, TS, TS, "rollback-verified"),
+    ]
+    _seed_ledger(connection, rows)
+    # A real derived projection table must not block the migration either.
+    from game_control.startup_estimates import STARTUP_ESTIMATE_DDL
+
+    for statement in STARTUP_ESTIMATE_DDL:
+        connection.execute(statement)
+    connection.execute(
+        "INSERT INTO startup_estimate_samples (profile_id, version, duration_ms, finished_at, run_key)"
+        " VALUES (?,?,?,?,?)",
+        ("terraria-tmod", "1.0", 1234, TS, "run-1"),
+    )
+    connection.commit()
+    connection.close()
+
+    result = run(source, target, report, retired)
+    assert result["quick_check"] == {"source": "ok", "target": "ok"}
+    target_db = sqlite3.connect(target)
+    preserved = target_db.execute(
+        "SELECT * FROM backup_payload_retirement ORDER BY operation_id"
+    ).fetchall()
+    assert preserved == sorted(rows, key=lambda row: row[0])
+    assert target_db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='backup_payload_retirement'"
+    ).fetchone()[0] == migration.EXPECTED_TABLE_SQL[migration.LEDGER_TABLE]
+    assert target_db.execute("SELECT COUNT(*) FROM backup_payload_retirement").fetchone()[0] == 2
+    assert target_db.execute("PRAGMA foreign_key_check").fetchall() == []
+    # Derived startup samples are disposable and intentionally not carried.
+    tables = {row[0] for row in target_db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert "startup_estimate_samples" not in tables
+    target_db.close()
+
+
+def test_unknown_table_still_fails_closed(tmp_path: Path):
+    source, target, report, retired = paths(tmp_path)
+    make_db(source)
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE mystery_ledger (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    with pytest.raises(migration.MigrationError, match="unsupported SQLite table set"):
+        run(source, target, report, retired)
+    assert not target.exists()
+
+
+def test_empty_retirement_ledger_is_preserved_not_dropped(tmp_path: Path):
+    """An empty safety ledger must still exist in the target with its identity."""
+    source, target, report, retired = paths(tmp_path)
+    make_db(source)
+    connection = sqlite3.connect(source)
+    connection.execute("SELECT COUNT(*) FROM backup_payload_retirement")
+    connection.commit()
+    connection.close()
+    run(source, target, report, retired)
+    target_db = sqlite3.connect(target)
+    assert target_db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='backup_payload_retirement'"
+    ).fetchone()[0] == migration.EXPECTED_TABLE_SQL[migration.LEDGER_TABLE]
+    assert target_db.execute("SELECT COUNT(*) FROM backup_payload_retirement").fetchone()[0] == 0
+    assert target_db.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+        " AND name='idx_backup_payload_retirement_backup'"
+    ).fetchone()[0] == 1
+    target_db.close()
+
+
+def _make_scratch_schema(path: Path, table_sql: dict, index_names, version: int | None = None) -> None:
+    connection = sqlite3.connect(path)
+    connection.create_function(
+        "is_rfc3339_timestamp", 1, migration._is_rfc3339_timestamp, deterministic=True
+    )
+    connection.execute(f"PRAGMA application_id = {migration.APP_ID}")
+    for _name, sql in table_sql.items():
+        connection.execute(sql)
+    for index_name in sorted(index_names):
+        connection.execute(migration.EXPECTED_INDEX_SQL[index_name])
+    for trigger_name in sorted(migration.EXPECTED_TRIGGERS):
+        connection.execute(migration.EXPECTED_TRIGGER_SQL[trigger_name])
+    connection.execute(f"PRAGMA user_version = {migration.SCHEMA_VERSION if version is None else version}")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+
+def _assert_ledger_gained(target: Path) -> None:
+    target_db = sqlite3.connect(target)
+    assert target_db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='backup_payload_retirement'"
+    ).fetchone()[0] == migration.EXPECTED_TABLE_SQL[migration.LEDGER_TABLE]
+    assert target_db.execute("SELECT COUNT(*) FROM backup_payload_retirement").fetchone()[0] == 0
+    assert target_db.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+        " AND name='idx_backup_payload_retirement_backup'"
+    ).fetchone()[0] == 1
+    assert target_db.execute("PRAGMA foreign_key_check").fetchall() == []
+    target_db.close()
+
+
+def test_clean_pre_ledger_schema4_upgrades_and_gains_empty_ledger(tmp_path: Path):
+    """The real fc726e9 schema-4 shape: benchmark table, no ledger/derived tables."""
+    source, target, report, retired = paths(tmp_path)
+    tables = {k: v for k, v in migration.EXPECTED_TABLE_SQL.items()
+              if k != migration.LEDGER_TABLE}
+    indexes = [name for name in migration.EXPECTED_INDEXES
+               if name != "idx_backup_payload_retirement_backup"]
+    _make_scratch_schema(source, tables, indexes)
+    result = run(source, target, report, retired)
+    assert result["quick_check"] == {"source": "ok", "target": "ok"}
+    _assert_ledger_gained(target)
+
+
+def test_schema3_legacy_benchmark_without_ledger_upgrades(tmp_path: Path):
+    """Pre-benchmark schema-3 shape (older benchmark_runs), still no ledger."""
+    source, target, report, retired = paths(tmp_path)
+    tables = {k: v for k, v in migration.EXPECTED_TABLE_SQL.items()
+              if k != migration.LEDGER_TABLE}
+    tables["benchmark_runs"] = migration.LEGACY_BENCHMARK_TABLE_SQL
+    indexes = [name for name in migration.EXPECTED_INDEXES
+               if name != "idx_backup_payload_retirement_backup"]
+    _make_scratch_schema(source, tables, indexes, version=3)
+    result = run(source, target, report, retired)
+    assert result["quick_check"] == {"source": "ok", "target": "ok"}
+    _assert_ledger_gained(target)
+
+
+def test_pre_ledger_schema_with_unknown_extra_table_still_fails_closed(tmp_path: Path):
+    source, target, report, retired = paths(tmp_path)
+    tables = {k: v for k, v in migration.EXPECTED_TABLE_SQL.items()
+              if k != migration.LEDGER_TABLE}
+    indexes = [name for name in migration.EXPECTED_INDEXES
+               if name != "idx_backup_payload_retirement_backup"]
+    _make_scratch_schema(source, tables, indexes)
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE smuggled_history (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    with pytest.raises(migration.MigrationError, match="unsupported SQLite table set"):
+        run(source, target, report, retired)
+    assert not target.exists()
+
+
 def paths(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
@@ -133,6 +300,19 @@ def test_migrates_every_actual_state_table_and_exact_retained_filter(tmp_path: P
     connection.execute("INSERT INTO player_sessions VALUES (?,?,?,?,?,?)", ("s1", "minecraft-sunlit-cobblemon", "Player", TS, TS, "log"))
     connection.execute("INSERT INTO player_sessions VALUES (?,?,?,?,?,?)", ("s2", "minecraft-sunlit-cobblemon", "Current", TS, None, "log"))
     connection.execute("INSERT INTO metric_samples VALUES (?,?,?,?)", ("terraria-tmod", "players", TS, 2.0))
+    # Terminal safety-ledger row: destructive-payload provenance that must
+    # survive the migration exactly.
+    connection.execute(
+        "INSERT INTO backup_payload_retirement (operation_id, backup_id, profile_id, state, path,"
+        " expected_device, expected_inode, expected_size, expected_mtime_ns, expected_ctime_ns,"
+        " expected_sha256, manifest_sha256, created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "op-purged-1", "b1", "terraria-tmod", "purged",
+            "/var/backups/game-servers/terraria-tmod/b1.tar.zst",
+            2049, 4242, 10, 1, 2, "c" * 64, "d" * 64, TS, TS,
+        ),
+    )
     connection.executemany(
         "INSERT INTO benchmark_runs(id,profile_id,baseline_preset,candidate_preset,state,created_at,finished_at,overall_verdict,summary_json,artifact_path,error_code) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
@@ -165,6 +345,7 @@ def test_migrates_every_actual_state_table_and_exact_retained_filter(tmp_path: P
         "player_sessions": 1,
         "metric_samples": 1,
         "benchmark_runs": 1,
+        "backup_payload_retirement": 1,
     }
     assert result["excluded_counts_by_table_reason"]["jobs"] == {"unfinished_job": 1}
     assert result["excluded_counts_by_table_reason"]["confirmations"] == {"transient_confirmation": 1}

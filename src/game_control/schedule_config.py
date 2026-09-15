@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .schedule import parse_schedule
+from .schedule import ScheduleEntry, parse_schedule
 
 
 class ScheduleConfigError(ValueError):
@@ -17,8 +19,60 @@ class ScheduleConfigError(ValueError):
 
 
 def _validate_path(path: Path) -> None:
-    if path.is_symlink() or not path.is_file() or path.parent.is_symlink():
+    if path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir() or (path.exists() and not path.is_file()):
         raise ScheduleConfigError("schedule config is unavailable")
+
+
+_TABLE_HEADER = re.compile(r"^\s*\[\[?[^\]]+\]\]?\s*$")
+
+
+def _without_toml_comment(line: str) -> str:
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is not None:
+            if char == "\\" and quote == '"':
+                index += 2
+                continue
+            if line.startswith(quote, index):
+                index += len(quote)
+                quote = None
+                continue
+        elif line.startswith('"""', index) or line.startswith("'''", index):
+            quote = line[index:index + 3]
+            index += 3
+            continue
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == "#":
+            return line[:index]
+        index += 1
+    return line
+
+
+def _advance_multiline(raw: str, quote: str | None) -> str | None:
+    """Track TOML multiline strings so header-looking text is not rewritten."""
+    index = 0
+    while index < len(raw):
+        if quote is not None:
+            end = raw.find(quote, index)
+            if end < 0:
+                return quote
+            index = end + 3
+            quote = None
+            continue
+        if raw.startswith('"""', index) or raw.startswith("'''", index):
+            quote = raw[index:index + 3]
+            index += 3
+            continue
+        if raw[index] == "#":
+            break
+        if raw[index] == '"':
+            index += 2 if index + 1 < len(raw) and raw[index - 1:index + 1] == '\\' else 1
+        else:
+            index += 1
+    return quote
 
 
 def _schedule_block(entries: Iterable[dict[str, Any]]) -> str:
@@ -52,19 +106,32 @@ def _without_schedule_blocks(raw: str) -> str:
     lines = raw.splitlines(keepends=True)
     output: list[str] = []
     skipping = False
+    multiline: str | None = None
     for line in lines:
-        stripped = line.strip()
-        if stripped == "[[schedule]]":
+        stripped = _without_toml_comment(line).strip()
+        header = bool(_TABLE_HEADER.match(stripped))
+        schedule_header = stripped == "[[schedule]]"
+        if multiline is None and schedule_header:
             skipping = True
-            continue
-        if skipping and stripped.startswith("["):
+        elif skipping and multiline is None and header:
             skipping = False
         if not skipping:
             output.append(line)
+        multiline = _advance_multiline(line, multiline)
     return "".join(output)
 
 
-def _validate_entries(entries: Any) -> list[dict[str, Any]]:
+def _first_table_marker(raw: str) -> int | None:
+    multiline: str | None = None
+    for index, line in enumerate(raw.splitlines(keepends=True)):
+        stripped = _without_toml_comment(line).strip()
+        if multiline is None and _TABLE_HEADER.match(stripped):
+            return index
+        multiline = _advance_multiline(line, multiline)
+    return None
+
+
+def _validate_entries(entries: Any) -> tuple[list[dict[str, Any]], tuple[ScheduleEntry, ...]]:
     if not isinstance(entries, (list, tuple)):
         raise ScheduleConfigError("schedules must be an array")
     normalized: list[dict[str, Any]] = []
@@ -94,19 +161,19 @@ def _validate_entries(entries: Any) -> list[dict[str, Any]]:
             **{key: entry[key] for key in ("operation", "baseline_preset", "candidate_preset", "campaign", "maintenance_window", "rollback_safe", "public_wake_policy") if key in entry},
         })
     try:
-        parse_schedule(normalized)
+        parsed = parse_schedule(normalized)
     except ValueError as exc:
         raise ScheduleConfigError(str(exc)) from exc
-    return normalized
+    return normalized, parsed
 
 
 def write_schedule_config(path: str | os.PathLike[str], entries: Any) -> None:
     target = Path(path)
     _validate_path(target)
-    normalized = _validate_entries(entries)
-    original = target.read_text(encoding="utf-8")
+    normalized, expected = _validate_entries(entries)
+    original = target.read_text(encoding="utf-8") if target.exists() else ""
     body = _without_schedule_blocks(original)
-    marker = next((index for index, line in enumerate(body.splitlines(keepends=True)) if line.lstrip().startswith("[")), None)
+    marker = _first_table_marker(body)
     if normalized:
         block = _schedule_block(normalized)
         if marker is None:
@@ -114,9 +181,20 @@ def write_schedule_config(path: str | os.PathLike[str], entries: Any) -> None:
         else:
             lines = body.splitlines(keepends=True)
             body = "".join(lines[:marker]) + block + "\n\n" + "".join(lines[marker:])
+    try:
+        original_parsed = tomllib.loads(original) if original else {}
+        parsed = tomllib.loads(body)
+        actual = parse_schedule(parsed.get("schedule", []))
+        original_without_schedule = {key: value for key, value in original_parsed.items() if key != "schedule"}
+        candidate_without_schedule = {key: value for key, value in parsed.items() if key != "schedule"}
+        if actual != expected or candidate_without_schedule != original_without_schedule:
+            raise ScheduleConfigError("schedule replacement could not be verified")
+    except tomllib.TOMLDecodeError as exc:
+        raise ScheduleConfigError("schedule replacement produced invalid TOML") from exc
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup = target.with_name(f"{target.name}.{stamp}.bak")
-    shutil.copy2(target, backup)
+    if target.exists():
+        backup = target.with_name(f"{target.name}.{stamp}.bak")
+        shutil.copy2(target, backup)
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent, text=True)
     temporary_path = Path(temporary)
     try:
@@ -124,10 +202,34 @@ def write_schedule_config(path: str | os.PathLike[str], entries: Any) -> None:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary_path, target.stat().st_mode & 0o777)
+        os.chmod(temporary_path, target.stat().st_mode & 0o777 if target.exists() else 0o640)
         os.replace(temporary_path, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         temporary_path.unlink(missing_ok=True)
 
 
-__all__ = ["ScheduleConfigError", "write_schedule_config"]
+def load_schedule_entries(config: dict[str, Any], override_path: str | os.PathLike[str]) -> Any:
+    """Load the writable sidecar, failing closed when it exists but is bad."""
+    override = Path(override_path)
+    if override.is_symlink():
+        raise ScheduleConfigError("schedule override is unavailable")
+    if not override.exists():
+        return config.get("schedule")
+    if not override.is_file() or override.parent.is_symlink():
+        raise ScheduleConfigError("schedule override is unavailable")
+    try:
+        with override.open("rb") as stream:
+            payload = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ScheduleConfigError("invalid schedule override") from exc
+    if not isinstance(payload, dict) or set(payload) - {"schedule"}:
+        raise ScheduleConfigError("invalid schedule override")
+    return payload.get("schedule", [])
+
+
+__all__ = ["ScheduleConfigError", "load_schedule_entries", "write_schedule_config"]

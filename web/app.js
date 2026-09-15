@@ -150,10 +150,34 @@ const announcer = byId("status-announcer");
 const profileLabel = (id) => state.profiles.get(id)?.display_name || id;
 const titleCase = (value) => String(value || "unknown").replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 const statusLabel = (value) => {
-  const label = titleCase(value);
+  const label = value === "updating" ? "Updating" : titleCase(value);
   return ["starting", "stopping"].includes(value) ? `${label}…` : label;
 };
 const slotOwnerId = () => [...state.statuses.values()].find((status) => status?.slot_owner)?.slot_owner || null;
+
+// Root-owned update activity.  ``update`` is the authoritative projection of a
+// live updater reservation or an accepted/running update job; ``active_job_id``
+// keeps older snapshots working without guessing from rendered text.
+function updateActive(status) {
+  return Boolean(status?.update) || status?.active_job_id === "update";
+}
+
+function displayState(status) {
+  return updateActive(status) ? "updating" : status?.state || "unknown";
+}
+
+// One slot means one updater: while any profile holds a live update, every
+// Start entrypoint stays paused (the server keeps its own fence as well).
+function updateOwner() {
+  for (const [id, status] of state.statuses) if (updateActive(status)) return id;
+  return null;
+}
+
+function updateNotice(name = null) {
+  return name
+    ? `Updating ${name}… Start is unavailable until the update finishes.`
+    : "Updating… Start is unavailable until the update finishes.";
+}
 
 function applyTheme(value, persist = false) {
   const theme = THEMES.includes(value) ? value : "ember";
@@ -592,11 +616,16 @@ function patchCard(id) {
   const profile = state.profiles.get(id) || { id, display_name: id, operations: [] };
   const status = state.statuses.get(id) || { profile_id: id, state: "unknown", health: "unknown" };
   const display = profile.display_name || id;
-  const current = status.state || "unknown";
+  const rawCurrent = status.state || "unknown";
+  const ownUpdate = updateActive(status);
+  const ownerUpdate = updateOwner();
+  const updating = ownUpdate || Boolean(ownerUpdate && ownerUpdate !== id);
+  const current = updating ? "updating" : rawCurrent;
   const operationSet = new Set(profile.operations || ["start", "stop", "restart"]);
   card.classList.toggle("is-active", status.slot_owner === id);
-  card.classList.remove("state-running", "state-starting", "state-stopping", "state-stopped", "state-blocked", "state-failed", "state-unknown");
+  card.classList.remove("state-running", "state-starting", "state-stopping", "state-stopped", "state-blocked", "state-failed", "state-unknown", "state-updating");
   card.classList.add(stateClass(current));
+  card.classList.toggle("is-updating", ownUpdate);
   card.querySelector(".profile-kicker").textContent = id;
   card.querySelector(".profile-name").textContent = display;
   card.querySelector(".profile-description").textContent = profile.public_endpoint?.host || "private";
@@ -611,31 +640,35 @@ function patchCard(id) {
   patchSparkline(card, id, status);
   const readiness = status.required_ports_ready ? "ready" : "process accepted; waiting for required ports";
   const reason = !state.statusConfirmed ? "Refreshing current status; actions are paused." :
+    ownUpdate ? updateNotice() :
+    updating ? updateNotice(profileLabel(ownerUpdate)) :
     current === "blocked" ? "Blocked: another server owns the active slot. Switch active server…" :
     current === "failed" ? "Previous health check failed; review details before starting." :
       current === "starting" ? (status.pid != null ? `Starting: process detected; ${readiness}.` : "Starting: request accepted; waiting for the server process.") :
         current === "stopping" ? "Stopping: actions are paused until shutdown completes." : "";
   card.querySelector(".card-reason").textContent = reason;
   const buttons = [
-    [".action-start", "Start", "start", !state.statusConfirmed || !["stopped", "failed", "blocked", "unknown"].includes(current) || !operationSet.has("start") || current === "blocked"],
-    [".action-stop", "Stop", "stop", !state.statusConfirmed || !["running", "starting"].includes(current) || !operationSet.has("stop")],
-    [".action-restart", "Restart", "restart", !state.statusConfirmed || current !== "running" || !operationSet.has("restart")],
+    [".action-start", "Start", "start", updating || !state.statusConfirmed || !["stopped", "failed", "blocked", "unknown"].includes(current) || !operationSet.has("start") || current === "blocked"],
+    [".action-stop", "Stop", "stop", updating || !state.statusConfirmed || !["running", "starting"].includes(current) || !operationSet.has("stop")],
+    [".action-restart", "Restart", "restart", updating || !state.statusConfirmed || current !== "running" || !operationSet.has("restart")],
   ];
   buttons.forEach(([selector, label, operation, disabled]) => {
     const button = card.querySelector(selector);
     button.textContent = label;
     button.disabled = Boolean(disabled);
     button.hidden = operation === "start"
-      ? !["stopped", "failed", "blocked", "unknown"].includes(current)
+      ? !["stopped", "failed", "blocked", "unknown"].includes(rawCurrent)
       : !["running", "starting"].includes(current);
     const why = reason ? ` (${reason})` : "";
     button.setAttribute("aria-label", `${label} ${display}`);
     button.title = button.disabled ? (why || "Action is unavailable in this state.") : "";
   });
   const switchButton = card.querySelector(".action-switch");
-  switchButton.disabled = status.slot_owner === id;
+  switchButton.disabled = status.slot_owner === id || updating;
   switchButton.setAttribute("aria-label", `Switch to ${display}`);
-  switchButton.title = switchButton.disabled ? "This server already owns the active slot." : "Preselect this server in the switch dialog.";
+  switchButton.title = switchButton.disabled
+    ? (updating ? "An update is in progress; switching is paused." : "This server already owns the active slot.")
+    : "Preselect this server in the switch dialog.";
   const manage = card.querySelector(".manage-link");
   manage.href = `#/servers/${encodeURIComponent(id)}/console`;
   manage.setAttribute("aria-label", `Manage ${display}`);
@@ -677,11 +710,12 @@ function patchActiveSlot() {
   copy.dataset.endpoint = endpoint || "";
   copy.setAttribute("aria-label", `Copy ${name} join address`);
   const offline = lifecycleOffline(target);
+  const updating = updateActive(target);
   byId("active-players").textContent = offline ? "Offline" : target.players_online == null ? "Not observed" : String(target.players_online);
   byId("active-uptime").textContent = offline ? "Offline" : uptime(target.uptime_seconds);
   byId("active-health").textContent = offline ? "Offline" : titleCase(target.health);
   slot.classList.toggle("is-empty", target.state === "stopped" || !ownerId);
-  slot.classList.toggle("is-transitional", ["starting", "stopping"].includes(target.state));
+  slot.classList.toggle("is-transitional", ["starting", "stopping"].includes(target.state) || updating);
   manage.href = `#/servers/${encodeURIComponent(targetId)}/console`;
   manage.setAttribute("aria-label", `Manage ${name}`);
   byId("session-activity-link").href = `#/servers/${encodeURIComponent(targetId)}/stats`;
@@ -696,6 +730,7 @@ function patchActiveSlot() {
   primary.dataset.sessionAction = state.statusConfirmed ? model.action : "none";
   primary.dataset.sessionProfileId = targetId;
   primary.disabled = !state.statusConfirmed || model.action === "none";
+  primary.dataset.updating = updating ? "true" : "false";
   patchSessionRunway(target, ownerId);
   patchStartupEstimate(target, ownerId);
   if (state.session.profileId !== targetId) {
@@ -724,6 +759,14 @@ function sessionEndpoint(profile) {
 
 function sessionModel(status, ownerId, targetId, endpoint) {
   const current = status?.state || "unknown";
+  const ownerUpdate = updateOwner();
+  if (updateActive(status) || ownerUpdate) {
+    return {
+      summary: updateNotice(ownerUpdate && ownerUpdate !== targetId ? profileLabel(ownerUpdate) : null),
+      action: "none",
+      actionLabel: "Updating…",
+    };
+  }
   const conflict = ownerId && ownerId !== targetId;
   if (conflict || current === "blocked") {
     const owner = ownerId ? profileLabel(ownerId) : "another server";
@@ -1062,7 +1105,25 @@ function applyStatus(snapshot, { confirmed = false } = {}) {
     const previousRun = metricRunKey(previous);
     const nextRun = metricRunKey({ ...previous, ...item });
     if (previousRun !== nextRun) {
-      state.metricHistory.delete(item.profile_id);
+      const retained = state.metricHistory.get(item.profile_id);
+      const runEnded = !nextRun && Boolean(previousRun) && ["stopped", "failed", "blocked"].includes(item.state);
+      if (runEnded && retained?.key === previousRun) {
+        // Keep the last session's retained observations instead of erasing the
+        // Metrics tab.  They render as explicitly historical values; a run
+        // switch or a new start still begins from a clean slate.
+        const sampleTimes = ["cpu", "memory", "players"]
+          .flatMap((name) => (retained[name] || []).map((point) => point?.t))
+          .filter((time) => Number.isFinite(time));
+        state.metricHistory.set(item.profile_id, {
+          ...retained,
+          historical: true,
+          startedAt: Date.parse(previous.started_at) || retained.startedAt,
+          // The range end is the last real sample, never the stop status time.
+          endedAt: sampleTimes.length ? Math.max(...sampleTimes) : null,
+        });
+      } else if (!runEnded) {
+        state.metricHistory.delete(item.profile_id);
+      }
       state.metricCapacity.delete(item.profile_id);
       state.metricSamples.delete(item.profile_id);
     }
@@ -1695,13 +1756,19 @@ function openSwitchDialog(targetId, opener) {
   byId("switch-confirm-text").value = "";
   setupDialog(switchDialog, opener);
   const expected = byId("switch-target").selectedOptions[0]?.textContent || "";
-  byId("switch-target-summary").textContent = expected || "Choose a target";
+  const updating = updateOwner();
+  byId("switch-target-summary").textContent = updating ? updateNotice(profileLabel(updating)) : expected || "Choose a target";
   byId("switch-confirm").disabled = true;
 }
 
 async function mutate(id, operation) {
   if (!state.statusConfirmed) {
     notify("Horizon is still confirming current status. Try again when the status check completes.");
+    return;
+  }
+  const updating = updateOwner();
+  if (operation === "start" && updating) {
+    notify(updateNotice(updating === id ? null : profileLabel(updating)));
     return;
   }
   const owner = [...state.statuses.values()].find((status) => status?.slot_owner)?.slot_owner;
@@ -1865,6 +1932,12 @@ function wireDialogForms() {
   const switchButton = byId("switch-confirm");
   const validateSwitch = () => {
     const expected = switchTarget.selectedOptions[0]?.textContent || "";
+    const updating = updateOwner();
+    if (updating) {
+      byId("switch-target-summary").textContent = updateNotice(profileLabel(updating));
+      switchButton.disabled = true;
+      return;
+    }
     byId("switch-target-summary").textContent = expected || "Choose a target";
     switchButton.disabled = !expected || switchText.value.trim().toLowerCase() !== expected.trim().toLowerCase();
   };
@@ -1873,6 +1946,8 @@ function wireDialogForms() {
   switchText.addEventListener("input", validateSwitch);
   byId("switch-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (event.submitter?.value === "cancel") { closeDialog(switchDialog); return; }
+    if (updateOwner()) { notify(updateNotice()); return; }
     if (switchButton.disabled) return;
     const current = slotOwnerId() || [...state.statuses.values()].find((item) => item.state === "running")?.profile_id;
     const target = switchTarget.value;
@@ -2095,21 +2170,43 @@ function metricSeries(result) {
 async function loadMetricHistory(id) {
   if (!pageVisible() || !id || state.detail.tab !== "metrics") return;
   const status = state.statuses.get(id) || {}; const key = metricRunKey(status);
-  if (!key || state.detail.id !== id || state.detail.metricAbort) return;
+  const retained = state.metricHistory.get(id);
+  // A stopped profile with no in-memory history still has a bounded server-side
+  // view; one fetch (no new persistence) shows recent observations on a cold
+  // load.  A failed attempt is remembered so the tab does not retry in a loop.
+  const cold = !key && status.state === "stopped" && !retained?.historical && !retained?.coldFailed;
+  if ((!key && !cold) || state.detail.id !== id || state.detail.metricAbort) return;
   const request = ++state.detail.metricRequest; state.detail.metricAbort?.abort();
   const controller = new AbortController(); state.detail.metricAbort = controller;
   try {
-    const windowKey = metricWindow(status.started_at);
-    const resolution = Date.now() - Date.parse(status.started_at) > 86400000 ? "1h" : "1m";
+    const windowKey = key ? metricWindow(status.started_at) : "24h";
+    const resolution = key && Date.now() - Date.parse(status.started_at) <= 86400000 ? "1m" : "1h";
     const options = { signal: controller.signal };
-    const hours = Math.min(8760, Math.max(1, Math.ceil((Date.now() - Date.parse(status.started_at)) / 3600000)));
+    const hours = key ? Math.min(8760, Math.max(1, Math.ceil((Date.now() - Date.parse(status.started_at)) / 3600000))) : 24;
     const [history, summary] = await Promise.all([
       api(`/api/v1/profiles/${encodeURIComponent(id)}/stats/tps?window=${windowKey}&resolution=${resolution}&limit=720`, options),
       api(`/api/v1/profiles/${encodeURIComponent(id)}/stats/summary?hours=${hours}`, options).catch(() => null),
     ]);
     const current = state.statuses.get(id) || {};
-    if (controller.signal.aborted || !pageVisible() || state.detail.tab !== "metrics" || request !== state.detail.metricRequest || state.detail.id !== id || metricRunKey(current) !== key) return;
+    if (
+      controller.signal.aborted || !pageVisible() || state.detail.tab !== "metrics"
+      || request !== state.detail.metricRequest || state.detail.id !== id
+      || (key ? metricRunKey(current) !== key : current.state !== "stopped")
+    ) return;
     const series = metricSeries(history);
+    if (!key) {
+      const points = [...series.cpu, ...series.memory, ...series.players].filter((point) => point.state !== "unavailable");
+      const times = points.map((point) => point.t).filter(Number.isFinite);
+      state.metricHistory.set(id, {
+        cold: true, historical: true, window: windowKey,
+        resolution: history.resolution || resolution, fetchedAt: Date.now(), stale: false,
+        startedAt: times.length ? Math.min(...times) : null,
+        endedAt: times.length ? Math.max(...times) : null,
+        ...series,
+      });
+      patchDetail(id);
+      return;
+    }
     const occupancy = summary?.occupancy?.samples;
     const previous = state.metricHistory.get(id);
     series.players = Array.isArray(occupancy)
@@ -2117,7 +2214,16 @@ async function loadMetricHistory(id) {
       : previous?.key === key ? previous.players || [] : [];
     state.metricHistory.set(id, { key, window: windowKey, resolution: history.resolution || resolution, fetchedAt: Date.now(), stale: false, playersStale: !Array.isArray(occupancy), ...series });
     patchDetail(id);
-  } catch (error) { if (!controller.signal.aborted && error?.name !== "AbortError" && request === state.detail.metricRequest && state.detail.id === id && metricRunKey(state.statuses.get(id)) === key) { const previous = state.metricHistory.get(id); state.metricHistory.set(id, { ...previous, key, stale: true, attemptedAt: Date.now() }); patchDetail(id); } }
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === "AbortError" || request !== state.detail.metricRequest || state.detail.id !== id) return;
+    const latest = state.statuses.get(id) || {};
+    if (key ? metricRunKey(latest) !== key : latest.state !== "stopped") return;
+    const previous = state.metricHistory.get(id);
+    state.metricHistory.set(id, key
+      ? { ...previous, key, stale: true, attemptedAt: Date.now() }
+      : { ...previous, cold: true, coldFailed: true, historical: true, stale: true, attemptedAt: Date.now() });
+    patchDetail(id);
+  }
   finally { if (state.detail.metricAbort === controller) state.detail.metricAbort = null; }
 }
 function startMetricRefresh(id) {
@@ -2792,7 +2898,11 @@ function patchDetail(id) {
   byId("detail-breadcrumb-name").textContent = ` / ${profile.display_name || id}`;
   byId("detail-title").textContent = profile.display_name || id;
   byId("detail-subtitle").textContent = profile.public_endpoint?.host || "private";
-  const current = status.state || "unknown";
+  const rawCurrent = status.state || "unknown";
+  const ownUpdate = updateActive(status);
+  const detailUpdateOwner = updateOwner();
+  const updating = ownUpdate || Boolean(detailUpdateOwner && detailUpdateOwner !== id);
+  const current = ownUpdate ? "updating" : rawCurrent;
   const offline = lifecycleOffline(status);
   const metricAvailability = {
     cpu: status.cpu_percent != null,
@@ -2808,6 +2918,12 @@ function patchDetail(id) {
   const badge = byId("detail-status");
   badge.className = `status-badge ${stateClass(current)}`;
   badge.querySelector(".status-text").textContent = statusLabel(current);
+  const updateNote = byId("detail-update-note");
+  if (updateNote) {
+    updateNote.hidden = !updating;
+    updateNote.dataset.source = ownUpdate ? status.update?.source || "job" : "";
+    updateNote.textContent = updating ? updateNotice(ownUpdate ? null : profileLabel(detailUpdateOwner)) : "";
+  }
   const operationSet = new Set(profile.operations || []);
   byId("tab-benchmarks").hidden = !operationSet.has("benchmark");
   if (state.detail.tab === "benchmarks") validateBenchmarkForm();
@@ -2817,11 +2933,11 @@ function patchDetail(id) {
   byId("detail-stop").hidden = !running && current !== "starting";
   byId("detail-restart").hidden = !running;
   byId("detail-force").hidden = !running;
-  byId("detail-start").disabled = !["stopped", "failed", "blocked", "unknown"].includes(current) || !operationSet.has("start");
-  byId("detail-stop").disabled = !operationSet.has("stop");
-  byId("detail-restart").disabled = !operationSet.has("restart");
-  byId("detail-force").disabled = !operationSet.has("stop");
-  const commandEnabled = running && operationSet.has("command");
+  byId("detail-start").disabled = updating || !["stopped", "failed", "blocked", "unknown"].includes(current) || !operationSet.has("start");
+  byId("detail-stop").disabled = updating || !operationSet.has("stop");
+  byId("detail-restart").disabled = updating || !operationSet.has("restart");
+  byId("detail-force").disabled = updating || !operationSet.has("stop");
+  const commandEnabled = running && !updating && operationSet.has("command");
   byId("command-input").disabled = !commandEnabled;
   byId("command-send").disabled = !commandEnabled;
   byId("command-input").placeholder = operationSet.has("command")
@@ -2841,6 +2957,29 @@ function patchDetail(id) {
   const memoryValue = runKey ? metricNumber(status.rss_bytes) : null;
   const cpuText = cpuValue == null ? "—" : `${cpuValue.toFixed(1)}% / ${cpuCapacity > 0 ? `${cpuCapacity.toFixed(0)}%` : "unknown"}`;
   const memoryText = memoryValue == null ? "—" : `${(memoryValue / 1073741824).toFixed(1)} / ${memoryCapacity > 0 ? `${(memoryCapacity / 1073741824).toFixed(1)} GiB` : "capacity unknown"}`;
+  const retained = state.metricHistory.get(id);
+  // A stopped profile shows retained observations as explicitly historical
+  // values, never as live samples, healthy defaults, or fabricated zeros.
+  const historical = !runKey && rawCurrent === "stopped" && retained?.historical === true;
+  const historicalWindow = historical && Number.isFinite(retained?.startedAt) && Number.isFinite(retained?.endedAt)
+    ? { start: retained.startedAt, end: retained.endedAt } : null;
+  const sampleValue = (point) => (point && point.state !== "unavailable" ? metricNumber(point.v) : null);
+  const historicalPoint = (seriesKey) => {
+    const series = (historical && retained?.[seriesKey]) || [];
+    for (let index = series.length - 1; index >= 0; index -= 1) {
+      const point = series[index];
+      if (!Number.isFinite(point?.t)) continue;
+      if (historicalWindow && (point.t < historicalWindow.start || point.t > historicalWindow.end)) continue;
+      const value = sampleValue(point);
+      if (value != null) return { ...point, value };
+    }
+    return null;
+  };
+  const historicalCpu = historicalPoint("cpu");
+  const historicalMemory = historicalPoint("memory");
+  const cpuTile = historicalCpu ? `${historicalCpu.value.toFixed(1)}%` : cpuText;
+  const memoryTile = historicalMemory ? `${historicalMemory.value.toFixed(1)} GiB` : memoryText;
+  const lastObservedAt = historical ? (retained?.endedAt ?? null) : null;
   byId("rail-cpu").textContent = cpuText;
   byId("rail-memory").textContent = memoryText;
   patchCapacityTrack("rail-cpu-capacity", cpuValue, cpuCapacity);
@@ -2851,15 +2990,20 @@ function patchDetail(id) {
   byId("rail-players-note").textContent = offline ? "Server is offline" : status.players_online == null ? "Player count unavailable" : "Players observed";
   byId("rail-version").textContent = formatVersion(status.installed_version);
   const configRestart = state.configRestartRequired.get(id) || [];
-  byId("rail-version-note").textContent = configRestart.length ? "Config changed · restart required" : status.restart_required ? "Update available · restart required" : status.required_ports_ready ? "Ready on required ports" : "Accepted; waiting for readiness";
+  // Only claim acceptance when the server is actually starting. A stopped
+  // profile is Offline, and an in-progress update says so plainly.
+  byId("rail-version-note").textContent = configRestart.length ? "Config changed · restart required" : status.restart_required ? "Update available · restart required" : ownUpdate ? "Updating…" : ["stopped", "failed", "blocked", "unknown"].includes(rawCurrent) ? "Offline" : status.required_ports_ready ? "Ready on required ports" : "Accepted; waiting for readiness";
   const samples = state.metricSamples.get(id) || { cpu: [], memory: [], players: [] };
   const history = state.metricHistory.get(id);
   void loadMetricCapacity(id);
-  const metricDomain = runKey ? { start: Date.parse(status.started_at), end: Date.now() } : null;
-  byId("metric-cpu-current").textContent = cpuText;
-  byId("metric-memory-current").textContent = memoryText;
+  const metricDomain = runKey ? { start: Date.parse(status.started_at), end: Date.now() }
+    : historicalWindow ? { start: historicalWindow.start, end: historicalWindow.end } : null;
+  // The label is only attached to a real retained value; a missing observation
+  // stays "—" rather than implying historical data exists.
+  byId("metric-cpu-current").textContent = historicalCpu ? `${cpuTile} (historical)` : cpuText;
+  byId("metric-memory-current").textContent = historicalMemory ? `${memoryTile} (historical)` : memoryText;
   byId("metric-players-current").textContent = offline ? "Offline" : status.players_online == null ? "Unavailable" : String(status.players_online);
-  const chartHistory = history?.key === runKey ? history : {};
+  const chartHistory = runKey && history?.key === runKey ? history : historical ? retained : {};
   const sampleTail = (key) => { const past = chartHistory[key] || []; const last = past.at(-1)?.t ?? 0; return [...past, ...(samples[key] || []).filter((point) => point.t > last)]; };
   const gapMs = chartHistory.resolution === "1h" ? 7200000 : chartHistory.resolution === "5m" ? 600000 : 120000;
   renderMetricChart("metric-cpu-chart", sampleTail("cpu"), { unit: "%", formatValue: (value) => value.toFixed(0), capacity: cpuCapacity, domain: metricDomain, gapMs });
@@ -2867,9 +3011,31 @@ function patchDetail(id) {
   renderMetricChart("metric-players-chart", sampleTail("players"), { formatValue: (value) => value.toFixed(0), domain: metricDomain });
   byId("metric-cpu-capacity").textContent = cpuCapacity > 0 ? "Current / available CPU capacity" : "Capacity unavailable · scale follows observed values";
   byId("metric-memory-capacity").textContent = memoryCapacity > 0 ? "Current RSS / effective memory limit" : "Capacity unavailable · scale follows observed values";
-  byId("metrics-run-note").textContent = metricDomain
+  const historyNote = byId("metrics-history-note");
+  if (historyNote) {
+    const cold = historical && retained?.cold === true;
+    const observed = lastObservedAt ? new Date(lastObservedAt).toLocaleString() : null;
+    const started = historicalWindow ? new Date(historicalWindow.start).toLocaleString() : null;
+    const state_ =
+      retained?.coldFailed ? "unavailable"
+        : historical ? (cold ? "recent" : "historical")
+          : rawCurrent === "stopped" ? "empty" : "live";
+    historyNote.dataset.state = state_;
+    historyNote.hidden = !historical && rawCurrent !== "stopped";
+    historyNote.textContent =
+      retained?.coldFailed ? "Recent history is unavailable right now. Live values return when the server starts."
+        : historical && !observed ? "Recent history has no usable observations. Live values return when the server starts."
+          : historical && cold
+            ? `Recent history · last observed ${observed} · bounded 24-hour view that may include more than one server run. This range spans ${started} → ${observed}; values are last observed, not live.`
+            : historical
+              ? `Historical · server run started ${started || "unknown"} · last observed ${observed}. Values are last observed, not live; offline time is not plotted as zero.`
+              : rawCurrent === "stopped" ? "No recent history available. Live values return when the server starts." : "";
+  }
+  byId("metrics-run-note").textContent = runKey && metricDomain
     ? `Since server started ${new Date(metricDomain.start).toLocaleString()} → now. ${chartHistory.stale ? "History refresh unavailable; retaining last observations." : chartHistory.fetchedAt ? "Retained history; gaps mean no observation." : "Loading retained history…"} Player history uses the latest 500 retained observations.${chartHistory.playersStale ? " Player history refresh unavailable." : ""}`
-    : current === "stopped" ? "Server stopped · no active run. No offline time is plotted as zero." : "Current run history unavailable until a process start is confirmed.";
+    : historical && metricDomain
+      ? `Retained history ${new Date(metricDomain.start).toLocaleString()} → ${new Date(metricDomain.end).toLocaleString()} (last observed sample). ${chartHistory.stale ? "History refresh unavailable; retaining last observations. " : ""}Offline time is not plotted as zero.`
+      : rawCurrent === "stopped" ? "Server stopped · no active run. No offline time is plotted as zero." : "Current run history unavailable until a process start is confirmed.";
   if (runKey && state.detail.tab === "metrics" && history?.key !== runKey) void loadMetricHistory(id);
   byId("metric-uptime").textContent = offline ? "Offline" : uptime(status.uptime_seconds);
   byId("metric-disk-free").textContent = formatBytes(status.disk_free_bytes);

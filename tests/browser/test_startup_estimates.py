@@ -123,6 +123,61 @@ def test_learning_before_five_samples_has_no_numeric_progress(estimate_page: Pag
     expect(estimate_page.locator("#startup-estimate-fill")).to_have_css("width", "0px")
 
 
+def test_four_of_five_stays_learning_and_five_enables_monotonic_estimate(estimate_page: Page):
+    enable_estimate(estimate_page)
+    emit(estimate_page, starting_snapshot(
+        estimate_page,
+        startup_estimate={
+            "sample_count": 4,
+            "median_seconds": None,
+            "attempt_id": "attempt-four",
+            "elapsed_seconds": 12.0,
+        },
+    ))
+    track = estimate_page.locator("#startup-estimate-track")
+    expect(estimate_page.locator("#startup-estimate-note")).to_have_text("Learning startup time… 4 of 5 starts recorded")
+    expect(track).to_have_attribute("data-mode", "learning")
+    assert track.get_attribute("aria-valuenow") is None
+    # The fifth recorded start turns on numeric progress without training the
+    # live server or changing the documented 5-success threshold.
+    emit(estimate_page, starting_snapshot(
+        estimate_page,
+        startup_estimate={
+            "sample_count": 5,
+            "median_seconds": 60.0,
+            "attempt_id": "attempt-five",
+            "elapsed_seconds": 30.0,
+        },
+    ))
+    expect(track).to_have_attribute("data-mode", "estimated")
+    first = int(track.get_attribute("aria-valuenow"))
+    assert 0 < first <= 99
+    # Progress is monotonic: more elapsed time never lowers the percentage.
+    estimate_page.evaluate("() => { window.__now += 6000; window.__horizonTest.startupEstimateTick(); }")
+    advanced = int(track.get_attribute("aria-valuenow"))
+    assert advanced > first
+    # A later authoritative ready status ends the numeric track at 100.
+    ready = copy.deepcopy(estimate_page._dashboard_fixture["status"])  # type: ignore[attr-defined]
+    ready["generation"] = int(getattr(estimate_page, "_estimate_generation", 10)) + 1
+    estimate_page._estimate_generation = ready["generation"]  # type: ignore[attr-defined]
+    emit(estimate_page, ready)
+    expect(track).to_have_attribute("data-mode", "ready")
+    expect(track).to_have_attribute("aria-valuenow", "100")
+    assert "100%" in (estimate_page.locator("#startup-estimate-fill").get_attribute("style") or "")
+
+
+def test_setting_survives_tab_navigation(estimate_page: Page):
+    base = estimate_page.url.split("#", 1)[0]
+    estimate_page.goto(f"{base}#/settings")
+    toggle = estimate_page.locator("#startup-estimate-toggle")
+    toggle.check()
+    assert estimate_page.evaluate("() => localStorage.getItem('helios-startup-estimate')") == "1"
+    estimate_page.goto(f"{base}#/")
+    estimate_page.goto(f"{base}#/settings")
+    expect(estimate_page.locator("#startup-estimate-toggle")).to_be_checked()
+    assert estimate_page.evaluate("() => window.__horizonTest.startupEstimateState().enabled") is True
+
+
 def test_missing_elapsed_never_fabricates_progress(estimate_page: Page):
     enable_estimate(estimate_page)
     emit(estimate_page, starting_snapshot(

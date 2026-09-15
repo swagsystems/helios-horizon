@@ -1309,6 +1309,7 @@ class RestoreService:
                             self._assert_lease()
                             if target.path.exists():
                                 os.replace(target.path, rollback)
+                                _fsync_dir(target.path.parent)
                             else:
                                 rollback_by_root[root_id] = None
                             rollbacks.append(rollback_by_root[root_id])
@@ -1319,6 +1320,7 @@ class RestoreService:
                             _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                             self._assert_lease()
                             os.replace(stagings[root_id], target.path)
+                            _fsync_dir(target.path.parent)
                             activated.append(root_id)
                             _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                     except Exception:
@@ -1361,10 +1363,20 @@ class RestoreService:
             raise SafeError("restore_failed", "restore could not be completed") from exc
 
     def finalize(self, result: RestoreResult) -> None:
+        if result.journal is not None:
+            try:
+                record = json.loads(result.journal.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("invalid restore journal")
+                record["phase"] = "committed"
+                _write_json_fsync(result.journal, record)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise SafeError("restore_finalize_failed", "restore journal commit could not be recorded") from exc
         for rollback in result.rollbacks or ((result.rollback,) if result.rollback is not None else ()):
             if rollback is None:
                 continue
-            shutil.rmtree(rollback, ignore_errors=True)
+            if rollback.exists():
+                shutil.rmtree(rollback)
             if rollback.exists():
                 raise SafeError("restore_finalize_failed", "restore rollback cleanup failed")
             _fsync_dir(rollback.parent)
@@ -1413,32 +1425,71 @@ class RestoreService:
                     for item in roots:
                         staging = Path(item["staging"])
                         if staging.exists():
-                            shutil.rmtree(staging, ignore_errors=True)
-                elif phase in {"displacing", "displaced", "publishing", "activated"}:
-                    if phase == "activated" and self.health_check is not None and all(self.health_check(Path(item["destination"])) for item in roots):
+                            shutil.rmtree(staging)
+                        if staging.exists():
+                            raise SafeError("restore_reconcile_failed", "restore staging cleanup failed")
+                elif phase in {"displacing", "displaced", "publishing", "activated", "committed"}:
+                    if phase == "committed":
                         for item in roots:
                             if item.get("rollback"):
                                 rollback = Path(item["rollback"])
-                                shutil.rmtree(rollback, ignore_errors=True)
+                                if rollback.exists():
+                                    shutil.rmtree(rollback)
                                 if rollback.exists():
                                     raise SafeError("restore_reconcile_failed", "restore rollback cleanup failed")
+                                _fsync_dir(rollback.parent)
+                            staging = Path(item["staging"])
+                            if staging.exists():
+                                shutil.rmtree(staging)
+                            if staging.exists():
+                                raise SafeError("restore_reconcile_failed", "restore staging cleanup failed")
+                    elif phase == "activated" and self.health_check is not None and all(self.health_check(Path(item["destination"])) for item in roots):
+                        # A journal marked activated is still undecided.  The
+                        # writer normally turns it into committed in finalize;
+                        # this branch preserves the historical recovery path
+                        # for journals written before that marker existed.
+                        record["phase"] = "committed"
+                        _write_json_fsync(journal, record)
+                        for item in roots:
+                            if item.get("rollback"):
+                                rollback = Path(item["rollback"])
+                                if rollback.exists():
+                                    shutil.rmtree(rollback)
+                                if rollback.exists():
+                                    raise SafeError("restore_reconcile_failed", "restore rollback cleanup failed")
+                                _fsync_dir(rollback.parent)
                     else:
                         activated = set(record.get("activated", []))
                         displaced = set(record.get("displaced", []))
                         for item in roots:
                             destination = Path(item["destination"])
                             rollback = item.get("rollback")
-                            if rollback and Path(rollback).exists() and (phase not in {"publishing", "displacing"} or item["root_id"] in activated or item["root_id"] in displaced or not destination.exists()):
+                            # The publication and its journal checkpoint are two
+                            # separate filesystem operations.  If the process
+                            # dies after os.replace(staging, destination) but
+                            # before the activated checkpoint, rollback is the
+                            # only durable proof that the destination was
+                            # displaced.  Always restore it; consulting the
+                            # recorded lists here can leave mixed generations
+                            # and orphan the rollback directory.
+                            if rollback and Path(rollback).exists():
                                 if destination.exists():
-                                    shutil.rmtree(destination, ignore_errors=True)
+                                    shutil.rmtree(destination)
                                 os.replace(rollback, destination)
-                            elif not item.get("original_exists", True) and (item["root_id"] in activated or item["root_id"] in displaced):
+                                _fsync_dir(destination.parent)
+                            elif not item.get("original_exists", True) and (
+                                item["root_id"] in activated
+                                or item["root_id"] in displaced
+                                or (not Path(item["staging"]).exists() and destination.exists())
+                            ):
                                 if destination.exists() or destination.is_symlink():
-                                    shutil.rmtree(destination, ignore_errors=True)
+                                    shutil.rmtree(destination)
                                     _fsync_dir(destination.parent)
                             staging = Path(item["staging"])
                             if staging.exists():
-                                shutil.rmtree(staging, ignore_errors=True)
+                                shutil.rmtree(staging)
+                            if staging.exists():
+                                raise SafeError("restore_reconcile_failed", "restore staging cleanup failed")
                 else:
                     continue
                 journal.unlink(missing_ok=True)
@@ -1454,19 +1505,24 @@ class RestoreService:
         if not isinstance(record, dict) or record.get("backup_id") is None:
             raise SafeError("restore_reconcile_failed", "restore journal is corrupt")
         phase = record.get("phase")
-        if phase not in {"staged", "displacing", "displaced", "publishing", "activated"}:
+        if phase not in {"staged", "displacing", "displaced", "publishing", "activated", "committed"}:
             raise SafeError("restore_reconcile_failed", "restore journal phase is invalid")
         approved = self._approved_roots()
         roots = record.get("roots")
         if not isinstance(roots, list) or len(roots) != len(approved):
             raise SafeError("restore_reconcile_failed", "restore journal roots are invalid")
-        expected = {str(path): _root_id(path) for path in approved}
-        seen: set[str] = set()
+        expected = {str(path): {_root_id(path)} for path in approved}
+        # Schema-1 archives and the journals written for them use root-0.  Keep
+        # accepting that identifier for the single approved root so journals
+        # already on disk remain recoverable after a daemon restart.
+        if len(approved) == 1:
+            expected[str(approved[0])].add("root-0")
+        seen_destinations: set[str] = set()
         for item in roots:
-            if not isinstance(item, dict) or item.get("root_id") in seen:
+            if not isinstance(item, dict):
                 raise SafeError("restore_reconcile_failed", "restore journal roots are invalid")
             rid, destination = item.get("root_id"), item.get("destination")
-            if rid not in set(expected.values()) or destination not in expected or expected[destination] != rid:
+            if destination not in expected or rid not in expected[destination] or destination in seen_destinations:
                 raise SafeError("restore_reconcile_failed", "restore journal destination is invalid")
             if not isinstance(item.get("original_exists"), bool):
                 raise SafeError("restore_reconcile_failed", "restore journal original state is invalid")
@@ -1479,12 +1535,13 @@ class RestoreService:
                 prefix = f".restore-{rid}-" if field == "staging" else ".rollback-"
                 if candidate.parent != parent or not candidate.name.startswith(prefix) or candidate.name == prefix:
                     raise SafeError("restore_reconcile_failed", "restore journal path is invalid")
-            seen.add(rid)
-        if seen != set(expected.values()):
+            seen_destinations.add(destination)
+        if seen_destinations != set(expected):
             raise SafeError("restore_reconcile_failed", "restore journal roots are incomplete")
         for field in ("activated", "displaced"):
             values = record.get(field, [])
-            if not isinstance(values, list) or len(values) != len(set(values)) or not set(values).issubset(seen):
+            valid_ids = {item.get("root_id") for item in roots}
+            if not isinstance(values, list) or len(values) != len(set(values)) or not set(values).issubset(valid_ids):
                 raise SafeError("restore_reconcile_failed", "restore journal state is invalid")
         return phase, roots
 

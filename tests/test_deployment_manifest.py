@@ -21,8 +21,13 @@ def test_manifest_is_typed_frozen_and_exactly_sized() -> None:
     assert isinstance(manifest, DeploymentManifest)
     assert len(manifest.files) == 48
     assert len(manifest.directories) == 50
-    assert len(manifest.runtime_sources) == 80
-    assert len(manifest.runtime_files_for()) == 132
+    # Exact projection size, not a lower bound: every ``src/game_control``
+    # module must be projected. baseline 832a619 shipped 82 sources while this
+    # assertion still read 80; the integration adds ``startup_estimates.py``
+    # (baseline omission) and the KubeJS compatibility module, so the reviewed
+    # count is 84 sources and 136 runtime files.
+    assert len(manifest.runtime_sources) == 84
+    assert len(manifest.runtime_files_for()) == 136
     assert manifest.generated_entry_point.name == "horizon"
     assert manifest.generated_entry_point.target == "/opt/game-control/.venv/bin/horizon"
     assert manifest.generated_entry_point.module == "game_control.cli:main"

@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import shutil
 import sqlite3
 import tarfile
 import threading
 import zipfile
+from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +27,23 @@ from game_control.models import (
     UpdateSpec,
 )
 from game_control.protocol import UpdateStatus
-from game_control.updates import UpdateService
+from game_control.updates import MAX_EXTRACTED_BYTES, MAX_MEMBER_BYTES, UpdateService
+
+
+_DiskUsage = namedtuple("_DiskUsage", "total used free")
+
+
+@pytest.fixture
+def ample_extraction_space(monkeypatch: pytest.MonkeyPatch):
+    """Deterministic free space so extraction cases exercise their own behavior.
+
+    The production guard is unchanged: it is only fed a bounded fake reading so
+    a host with little free space does not pre-empt the success/invalid-archive
+    assertions. The low-disk refusal itself is still proven below.
+    """
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _path: _DiskUsage(10**12, 0, 10**12)
+    )
 
 
 class _FalseyClient:
@@ -451,7 +469,9 @@ def test_failed_steamcmd_update_is_safe_and_recorded(tmp_path: Path):
     db.close()
 
 
-def test_release_update_accepts_raw_payload_and_uses_clock_version(tmp_path: Path):
+def test_release_update_accepts_raw_payload_and_uses_clock_version(
+    tmp_path: Path, ample_extraction_space
+):
     profile = _profile(
         tmp_path,
         version_command=(),
@@ -701,7 +721,9 @@ def test_release_update_rejects_missing_executable_without_moving_current(tmp_pa
     assert current.resolve() == prior
 
 
-def test_release_update_rejects_zip_path_traversal_without_moving_current(tmp_path: Path):
+def test_release_update_rejects_zip_path_traversal_without_moving_current(
+    tmp_path: Path, ample_extraction_space
+):
     profile = _profile(tmp_path, version_command=())
     prior = profile.paths.install_root / "releases" / "prior"
     prior.mkdir(parents=True)
@@ -746,7 +768,9 @@ def test_release_update_rejects_zip_path_traversal_without_moving_current(tmp_pa
     assert not (profile.paths.install_root / "outside").exists()
 
 
-def test_release_update_rejects_tar_symlink_without_moving_current(tmp_path: Path):
+def test_release_update_rejects_tar_symlink_without_moving_current(
+    tmp_path: Path, ample_extraction_space
+):
     profile = _profile(tmp_path, version_command=())
     prior = profile.paths.install_root / "releases" / "prior"
     prior.mkdir(parents=True)
@@ -813,3 +837,52 @@ def test_rollback_requires_real_release_directory_and_can_switch_pointer(tmp_pat
 
     assert result.state == "rolled_back"
     assert current.resolve() == newer
+
+
+def test_release_extraction_refuses_insufficient_free_space(tmp_path: Path, monkeypatch):
+    """The production guard still refuses extraction when free space is short."""
+    profile = _profile(tmp_path, version_command=())
+    prior = profile.paths.install_root / "releases" / "prior"
+    prior.mkdir(parents=True)
+    (prior / "game").write_text("old")
+    current = profile.paths.install_root / "current"
+    current.symlink_to(prior, target_is_directory=True)
+    archive_path = tmp_path / "release.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("game", "new")
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self):
+            yield archive_path.read_bytes()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Client:
+        def stream(self, _method, _url, **_kwargs):
+            return Response()
+
+    profile = profile.model_copy(update={"update": profile.update.model_copy(update={
+        "sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+    })})
+    service = UpdateService(
+        {profile.id.value: profile},
+        backup_service=_Backup(tmp_path / "pre.tar.zst"),
+        http_client=Client(),
+        stopped_check=lambda _p: True,
+    )
+
+    # One byte below the production headroom: the guard must refuse.
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda _path: _DiskUsage(1, 0, MAX_EXTRACTED_BYTES + MAX_MEMBER_BYTES - 1),
+    )
+    with pytest.raises(SafeError, match="insufficient free space"):
+        service.apply(profile.id)
+    assert current.resolve() == prior

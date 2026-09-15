@@ -816,7 +816,9 @@ def _check_target_package(checks: Checks) -> None:
             "ConditionPathExists=/etc/game-control/arm/bore-minecraft",
             "Environment=BoreRemoteHost=",
             "/usr/local/bin/bore local 25565 --local-host 127.0.0.1 --to ${BoreRemoteHost} --port 25565",
-            "Restart=no",
+            "Restart=always",
+            "RestartSec=15",
+            "StartLimitIntervalSec=0",
         ),
         "horizon-terraria-relay.service": (
             "ConditionPathExists=/etc/game-control/arm/horizon-terraria",

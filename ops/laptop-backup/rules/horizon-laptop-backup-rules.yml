@@ -1,0 +1,57 @@
+groups:
+  - name: horizon-laptop-backup
+    rules:
+      - alert: HeliosHorizonLaptopBackupCollectorFailed
+        expr: helios_laptop_backup_collector_success == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "laptop backup collector reported failure"
+      - alert: HeliosHorizonLaptopBackupCollectorStale
+        expr: absent(helios_laptop_backup_collector_timestamp_seconds) or time() - helios_laptop_backup_collector_timestamp_seconds > 180
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "laptop backup collector metrics are missing or stale"
+      # Actual age of a known success. Absence is deliberately NOT treated as
+      # 36h staleness: a collector failure drops the series and must not claim a
+      # false backup-age breach. Observability loss is covered by the collector
+      # failed/stale alerts above.
+      - alert: HeliosHorizonLaptopBackupStale
+        expr: time() - helios_laptop_backup_last_success_timestamp_seconds > 129600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "no successful laptop backup within 36h"
+      # A healthy collector that reports no known success (never backed up).
+      # Built on the per-host collector series and joined to the last-success
+      # series on job/instance, so one host's success cannot mask another and the
+      # alert keeps its scrape labels. Suppressed while a run is legitimately in
+      # progress; the stuck-running rule covers a wedged attempt.
+      - alert: HeliosHorizonLaptopBackupNoSuccessKnown
+        expr: (helios_laptop_backup_collector_success == 1) unless on(job, instance) helios_laptop_backup_last_success_timestamp_seconds unless on(job, instance) (helios_laptop_backup_last_attempt_running == 1)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "laptop backup collector reports no successful backup yet"
+      # The sender's existing service timeout is six hours; a run older than that
+      # is very likely wedged. This is a monitoring warning against the existing
+      # limit, not a new service deadline.
+      - alert: HeliosHorizonLaptopBackupStuckRunning
+        expr: (helios_laptop_backup_last_attempt_running == 1) and (time() - helios_laptop_backup_last_attempt_timestamp_seconds > 21600)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "laptop backup attempt has been running longer than the 6h service limit"
+      - alert: HeliosHorizonLaptopBackupFailed
+        expr: helios_laptop_backup_last_attempt_hard_failure == 1
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "laptop backup attempt failed, excluding AC or battery deferral"

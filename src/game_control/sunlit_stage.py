@@ -17,6 +17,7 @@ from game_control.modpack_update import (
     assemble,
     assemble_versioned_runtime,
 )
+from game_control.sunlit_kubejs_compat import apply_transforms, parse_policy_transforms
 
 
 class StageError(ValueError):
@@ -65,6 +66,7 @@ def _policy_values(document: dict):
 
 def stage(args: argparse.Namespace) -> dict:
     document = _load_manifest(args.manifest)
+    transforms = parse_policy_transforms(document["runtime_policy"])
     candidate_root = args.candidate_root
     if candidate_root.exists() or candidate_root.is_symlink():
         raise StageError("candidate root must not exist")
@@ -94,6 +96,10 @@ def stage(args: argparse.Namespace) -> dict:
             mutable_vendor_dirs=policy[3], empty_mutable_dirs=policy[4],
             fixed_symlinks=policy[5], text_overrides=policy[6],
         )
+        # Reviewed compatibility transforms run only after every artifact and
+        # baked-output precondition holds; a refusal here aborts the whole
+        # candidate rather than shipping a release the game cannot load.
+        compatibility = apply_transforms(runtime, transforms, document["artifact"]["version"])
         shutil.rmtree(vendor)
         dirfd = os.open(candidate_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try: os.fsync(dirfd)
@@ -108,6 +114,7 @@ def stage(args: argparse.Namespace) -> dict:
             "runtime_files_and_links": len(runtime_report.files),
             "preserved": list(runtime_report.preserved),
             "mutable_and_fixed": list(runtime_report.overlays),
+            "compatibility_transforms": compatibility,
             "active": False,
         }
         output = candidate_root / "candidate.json"

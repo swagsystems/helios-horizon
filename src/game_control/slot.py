@@ -669,6 +669,30 @@ class ReservationStore:
 
     validate_for_runner = valid_for_runner
 
+    def live_update(self, profile: str | ProfileId | None = None) -> Reservation | None:
+        """Return the live ``operation_kind="update"`` reservation, if any.
+
+        Only the updater handoff reservation qualifies: a lifecycle reservation
+        held by a start/stop or a generic maintenance job is not an update, and
+        an expired or dead-controller record is reported as absent so a stale
+        reservation cannot permanently gray a profile.
+        """
+        try:
+            requested = None if profile is None else _profile(profile)
+        except ValueError:
+            return None
+        reservation = self.read()
+        if reservation is None or reservation.operation_kind != "update":
+            return None
+        if requested is not None and reservation.profile_id != requested:
+            return None
+        try:
+            if not self._live(reservation):
+                return None
+        except (OSError, ValueError, PermissionError):
+            return None
+        return reservation
+
     def reconcile(self) -> bool:
         """Remove an invalid, expired, or dead-controller reservation."""
         if os.geteuid() != 0:
@@ -690,8 +714,6 @@ class ReservationStore:
             now < reservation.expires_at <= now + MAX_RESERVATION_TTL
             and self.pid_start_ticks(reservation.controller_pid) == reservation.controller_start_ticks
         )
-
-    renew = reserve
 
 
 class SlotInspector:

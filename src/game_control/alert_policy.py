@@ -24,6 +24,14 @@ MEMORY_RECOVERY_BYTES = 256 * 1024 * 1024
 WAKE_SLO_THRESHOLD_MS = 180_000.0
 MAX_RUNTIME_SAMPLES = 256
 
+# A sample up to this much older than the window may still count toward it.
+# Without slack, a window is only satisfied when a poll lands exactly on the
+# boundary, which real fractional-cadence polling never does; too much slack
+# would let a stale low sample keep a window "sustained" (or mask recovery).
+# Half the nominal 10 s slotd sampling cadence absorbs fractional jitter while
+# still pruning genuinely out-of-window samples.
+SUSTAINED_SPAN_TOLERANCE_SECONDS = 5.0
+
 
 class AlertSignal(StrEnum):
     SUSTAINED_MSPT = "sustained_mspt"
@@ -157,7 +165,11 @@ class PerformanceAlertEvaluator:
             if mspt is not None:
                 samples = self._mspt[profile_id]
                 samples.append((timestamp, mspt))
-                while samples and samples[0][0] < timestamp - MSPT_SUSTAINED_SECONDS:
+                # Retain a boundary sample up to the span tolerance beyond the
+                # window so the span is measured over real elapsed time rather
+                # than depending on the exact poll instant.
+                boundary = timestamp - MSPT_SUSTAINED_SECONDS - SUSTAINED_SPAN_TOLERANCE_SECONDS
+                while len(samples) > 1 and samples[0][0] < boundary:
                     samples.popleft()
                 current[AlertSignal.SUSTAINED_MSPT] = bool(
                     len(samples) >= MSPT_MIN_SAMPLES
@@ -169,7 +181,8 @@ class PerformanceAlertEvaluator:
             if rss is not None:
                 samples = self._rss[profile_id]
                 samples.append((timestamp, rss))
-                while samples and samples[0][0] < timestamp - MEMORY_GROWTH_WINDOW_SECONDS:
+                boundary = timestamp - MEMORY_GROWTH_WINDOW_SECONDS - SUSTAINED_SPAN_TOLERANCE_SECONDS
+                while len(samples) > 1 and samples[0][0] < boundary:
                     samples.popleft()
                 span = timestamp - samples[0][0] if samples else 0
                 growth = rss - samples[0][1] if samples else 0

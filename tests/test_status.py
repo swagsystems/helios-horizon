@@ -12,6 +12,86 @@ from game_control.capability_evidence import WakeSafetyEvidence
 from game_control.status import StatusService, derive_state
 
 
+class _Reservation:
+    def __init__(
+        self,
+        profile_id="minecraft",
+        operation_id="update-1",
+        operation_kind="update",
+        expires_at=1_800_000_000.0,
+    ):
+        self.profile_id = profile_id
+        self.operation_id = operation_id
+        self.operation_kind = operation_kind
+        self.expires_at = expires_at
+
+
+@pytest.mark.asyncio
+async def test_status_projects_update_activity_from_live_reservation():
+    service = StatusService(
+        [SimpleNamespace(id="minecraft")],
+        active_jobs={},
+        update_reservations=lambda profile_id: _Reservation() if str(profile_id) == "minecraft" else None,
+    )
+    snapshot = await service.cached_snapshot()
+    (status,) = snapshot.profiles
+    assert status.update is not None
+    assert status.update.source == "reservation"
+    assert status.update.operation_id == "update-1"
+    assert status.update.expires_at is not None
+    assert status.state is ObservedState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_status_projects_update_activity_from_update_job_only():
+    service = StatusService(
+        [SimpleNamespace(id="minecraft"), SimpleNamespace(id="pz-rising")],
+        active_jobs={"minecraft": "update", "pz-rising": "backup"},
+    )
+    snapshot = await service.cached_snapshot()
+    statuses = {status.profile_id: status for status in snapshot.profiles}
+    assert statuses["minecraft"].update is not None
+    assert statuses["minecraft"].update.source == "job"
+    assert statuses["minecraft"].update.operation_id is None
+    # A generic backup job is not an update.
+    assert statuses["pz-rising"].update is None
+
+
+@pytest.mark.asyncio
+async def test_status_update_activity_clears_when_records_disappear():
+    reservation = {"value": _Reservation()}
+    service = StatusService(
+        [SimpleNamespace(id="minecraft")],
+        active_jobs={},
+        update_reservations=lambda profile_id: reservation["value"],
+    )
+    first = await service.cached_snapshot()
+    assert first.profiles[0].update is not None
+    # A released or expired reservation must not permanently gray the profile.
+    reservation["value"] = None
+    second = await service.cached_snapshot()
+    assert second.profiles[0].update is None
+
+
+@pytest.mark.asyncio
+async def test_initializing_projection_survives_unreadable_job_provider():
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("jobs table is unavailable")
+
+    service = StatusService(
+        [SimpleNamespace(id="minecraft")],
+        active_jobs=explode,
+        update_reservations=lambda _profile_id: (_ for _ in ()).throw(RuntimeError("reservation unreadable")),
+    )
+    # The cold/initializing projection must stay a bounded status payload
+    # instead of failing the request; unknown evidence never becomes "update".
+    snapshot = await service.cached_snapshot()
+    (status,) = snapshot.profiles
+    assert status.state in set(ObservedState)
+    assert status.active_job_id is None
+    assert status.update is None
+
+
 def test_typed_telemetry_health_provider_precedes_legacy_storage():
     service = StatusService(
         [],

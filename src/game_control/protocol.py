@@ -192,7 +192,11 @@ class ScheduleSpec(RpcModel):
     profile: ProfileId
     enabled: StrictBool = True
     backup_destination: BackupDestination | None = None
-    operation: Literal["backup", "switch", "benchmark"] = "backup"
+    # ``None`` means "not stated": the operation is then inferred from the
+    # destination exactly like ``parse_schedule`` so legacy schedules stay
+    # backward compatible.  A caller that explicitly asks for ``backup`` must
+    # supply a destination.
+    operation: Literal["backup", "switch", "benchmark"] | None = None
     baseline_preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
     candidate_preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
     campaign: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -206,6 +210,17 @@ class ScheduleSpec(RpcModel):
         if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
             raise ValueError("cron contains a control character")
         return value.strip()
+
+    @model_validator(mode="after")
+    def resolve_operation(self) -> "ScheduleSpec":
+        if self.operation is None:
+            object.__setattr__(
+                self, "operation",
+                "backup" if self.backup_destination is not None else "switch",
+            )
+        elif self.operation == "backup" and self.backup_destination is None:
+            raise ValueError("backup schedules require a destination")
+        return self
 
 
 class GetSchedules(RpcModel):
@@ -615,6 +630,20 @@ class StartupEstimate(RpcModel):
     version: str | None = Field(default=None, max_length=64)
 
 
+class UpdateActivity(RpcModel):
+    """Authoritative in-flight update activity for one profile.
+
+    ``source`` records which root-owned record proves the update: a live
+    ``operation_kind="update"`` lifecycle reservation (the updater handoff) or
+    an accepted/running controller job whose operation is ``update``.  A
+    generic backup/maintenance job never produces this record.
+    """
+
+    source: Literal["reservation", "job"] = "job"
+    operation_id: str | None = Field(default=None, max_length=64)
+    expires_at: datetime | None = None
+
+
 class ProfileStatus(RpcModel):
     profile_id: ProfileId
     state: ObservedState
@@ -634,6 +663,7 @@ class ProfileStatus(RpcModel):
     disk_read_bps: float | None = None
     disk_write_bps: float | None = None
     startup_estimate: StartupEstimate | None = None
+    update: UpdateActivity | None = None
 
 
 class StatusSnapshot(RpcModel):
@@ -666,6 +696,35 @@ class PerfDatabase(RpcModel):
     query_ms: PerfAggregate = Field(default_factory=lambda: PerfAggregate(count=0))
 
 
+# Finite action allowlist mirrored in game_control.perf.ACTION_ENUM; a test
+# pins the two sets together so the wire contract cannot admit free-form labels.
+PerfEventAction = Literal[
+    "other", "status", "perf", "watch", "wait_readiness", "start", "stop",
+    "restart", "backup", "restore", "update", "switch", "retirement",
+    "world_clone", "benchmark", "command", "config", "notification", "maintenance",
+]
+
+
+class PerfEvent(RpcModel):
+    """One bounded timing observation: label, duration and clock stamps only."""
+
+    sequence: int = Field(ge=0)
+    action: PerfEventAction
+    duration_ms: float = Field(ge=0)
+    ended_at: datetime
+    monotonic_start: float | None = None
+    monotonic_end: float | None = None
+
+
+class PerfEventWindow(RpcModel):
+    items: tuple[PerfEvent, ...] = Field(default=(), max_length=256)
+    instance: str = Field(default="", max_length=64)
+    sequence: dict[str, int] = Field(default_factory=lambda: {"start": 0, "end": 0})
+    capacity: int = Field(default=0, ge=0, le=4096)
+    dropped: int = Field(default=0, ge=0)
+    rejected: int = Field(default=0, ge=0)
+
+
 class PerfSnapshot(RpcModel):
     cycle: PerfAggregate
     rpc: PerfAggregate
@@ -674,6 +733,10 @@ class PerfSnapshot(RpcModel):
     maintenance_sequence: dict[str, int] = Field(default_factory=lambda: {"start": 0, "end": 0})
     event_loop_lag_ms: tuple[float, ...] = ()
     event_loop_lag_sequence: dict[str, int] = Field(default_factory=lambda: {"start": 0, "end": 0})
+    instance: str = Field(default="", max_length=64)
+    rpc_events: PerfEventWindow = Field(default_factory=PerfEventWindow)
+    event_loop_lag_events: PerfEventWindow = Field(default_factory=PerfEventWindow)
+    maintenance_events: PerfEventWindow = Field(default_factory=PerfEventWindow)
     databases: dict[str, PerfDatabase] = Field(default_factory=dict)
 
 

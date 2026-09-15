@@ -42,6 +42,10 @@ def test_state_database_migrates_with_append_only_operational_tables(tmp_path: P
         "player_sessions",
         "metric_samples",
         "benchmark_runs",
+        # Additive, disposable audit ledger created idempotently at open. It is
+        # intentionally outside the canonical version-4 schema. (The startup
+        # estimate projection table is created lazily by the sampler, not here.)
+        "backup_payload_retirement",
     }
     assert set(db.connection.execute("select name from sqlite_master where type='table'").fetchall()) == {
         (name,) for name in expected

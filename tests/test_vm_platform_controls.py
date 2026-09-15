@@ -289,7 +289,12 @@ def test_journald_namespace_contract_and_fenced_relays():
     assert "ExecStart=/usr/local/bin/bore local 25565 --local-host 127.0.0.1 --to ${BoreRemoteHost} --port 25565" in bore
     assert "User=svc-bore" in bore
     assert "OnFailure=horizon-alert-notify@bore-minecraft-fenced.service" in bore
-    assert "Restart=no" in bore
+    # A dropped or rebooted remote relay can end the client with status 0, so
+    # the unit must recover unexpected exits itself while an explicit stop and
+    # the arm-marker fence keep suppressing intentional shutdowns.
+    assert "Restart=always" in bore
+    assert "RestartSec=15" in bore
+    assert "StartLimitIntervalSec=0" in bore.split("[Service]", 1)[0]
     assert "[Install]" not in bore
     assert "SECRET" not in bore.upper() or "EnvironmentFile" in bore
 

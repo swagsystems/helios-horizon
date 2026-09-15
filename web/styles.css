@@ -244,7 +244,10 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .state-running .status-dot, .state-healthy .status-dot { background: var(--healthy); }
 .state-starting .status-dot, .state-stopping .status-dot { background: var(--warn); }
+.state-updating .status-dot { background: var(--warn); }
 .state-failed .status-dot, .state-blocked .status-dot { background: var(--danger); }
+.profile-card.is-updating::before { background: linear-gradient(180deg, var(--warn), #8a6c1f); }
+.detail-update-note { margin: 4px 0 0; color: var(--warn); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; line-height: 1.3; }
 .profile-name { margin-top: 8px; }
 .profile-description { min-height: 16px; margin: 2px 0 6px; color: var(--muted); font-size: .8rem; line-height: 1.3; }
 .cpu-sparkline { display: block; width: 100%; height: 22px; margin: 0; overflow: visible; }
@@ -380,6 +383,7 @@ dd { margin: 4px 0 0; font-weight: 700; }
 .capacity-track { width: 100%; height: 5px; margin: 8px 0; border: 0; background: var(--raised); overflow: hidden; }
 .capacity-track > i { display: block; width: 0; height: 100%; background: var(--accent); }
 .metrics-run-note { margin: 0 0 var(--sp-4); color: var(--muted); font-size: .8rem; }
+.metrics-history-note { margin-top: calc(var(--sp-3) * -1); border-left: 2px solid var(--warn); padding-left: var(--sp-2); }
 .stats-panel { display: grid; gap: var(--sp-6); }
 .stats-heading, .stats-block-heading { display: flex; align-items: end; justify-content: space-between; gap: var(--sp-4); }
 .stats-heading h2 { margin-top: 6px; }

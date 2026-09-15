@@ -137,6 +137,7 @@
               <p class="breadcrumb"><a href="#/">Servers</a><span id="detail-breadcrumb-name"> / Server</span></p>
               <h1 id="detail-title">Server</h1>
               <p class="detail-subtitle" id="detail-subtitle">private</p>
+              <p class="detail-update-note" id="detail-update-note" role="status" hidden></p>
             </div>
             <div class="detail-header-right">
               <span class="status-badge" id="detail-status"><span class="status-dot" aria-hidden="true"></span><span class="status-text">Unknown</span></span>
@@ -184,6 +185,7 @@
               </section>
               <section class="detail-panel" id="panel-metrics" role="tabpanel" aria-labelledby="tab-metrics" tabindex="0" hidden>
                 <p class="metrics-run-note" id="metrics-run-note">Waiting for current server run.</p>
+                <p class="metrics-run-note metrics-history-note" id="metrics-history-note" role="status" hidden></p>
                 <div class="metrics-grid">
                   <article class="metric-chart" data-metric="cpu"><h2>CPU</h2><strong id="metric-cpu-current">Unavailable</strong><p class="metric-capacity" id="metric-cpu-capacity">Capacity: unknown</p><svg id="metric-cpu-chart" viewBox="0 0 220 110" aria-label="CPU chart"><line class="chart-axis" x1="30" y1="8" x2="30" y2="90"></line><line class="chart-axis" x1="30" y1="90" x2="215" y2="90"></line><text class="chart-ymax" x="26" y="12" text-anchor="end">100%</text><text class="chart-ymid" x="26" y="52" text-anchor="end">50%</text><text x="26" y="94" text-anchor="end">0</text><text class="chart-x0" x="30" y="106">—</text><text class="chart-x1" x="215" y="106" text-anchor="end">—</text><polyline class="chart-line" points="30,90 215,90"></polyline></svg><p>Process CPU · 100% per assigned core</p></article>
                   <article class="metric-chart" data-metric="memory"><h2>Memory RSS</h2><strong id="metric-memory-current">Unavailable</strong><p class="metric-capacity" id="metric-memory-capacity">Capacity: unknown</p><svg id="metric-memory-chart" viewBox="0 0 220 110" aria-label="Memory RSS chart"><line class="chart-axis" x1="30" y1="8" x2="30" y2="90"></line><line class="chart-axis" x1="30" y1="90" x2="215" y2="90"></line><text class="chart-ymax" x="26" y="12" text-anchor="end">Capacity unknown</text><text class="chart-ymid" x="26" y="52" text-anchor="end">—</text><text x="26" y="94" text-anchor="end">0</text><text class="chart-x0" x="30" y="106">—</text><text class="chart-x1" x="215" y="106" text-anchor="end">—</text><polyline class="chart-line" points="30,90 215,90"></polyline></svg><p>Observed resident memory · retained history</p></article>
@@ -407,7 +409,7 @@
     </dialog>
 
     <dialog class="dialog" id="switch-dialog" aria-labelledby="switch-dialog-title">
-      <form method="dialog" class="dialog-form" id="switch-form">
+      <form method="dialog" class="dialog-form" id="switch-form" novalidate>
         <div class="dialog-header">
           <div><p class="eyebrow">Confirmation required</p><h2 id="switch-dialog-title">Switch active server</h2></div>
           <button class="icon-button" value="cancel" aria-label="Close switch dialog">×</button>

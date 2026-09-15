@@ -14,6 +14,8 @@ import urllib.parse
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from game_control.sunlit_kubejs_compat import reviewed_compatibility_transforms
+
 PROFILE = "minecraft-sunlit-cobblemon"
 PERSISTENT_DIRS = ["world", "battle_logs", "easy_npc", "journeymap", "local", "trainers"]
 REQUIRED_PERSISTENT_FILES = [
@@ -197,6 +199,10 @@ def make_manifest(args: argparse.Namespace) -> dict:
             "empty_mutable_dirs": EMPTY_MUTABLE_DIRS,
             "fixed_symlinks": {"libraries": "/opt/game-servers/minecraft-sunlit-cobblemon/libraries"},
             "text_overrides": [SEASON_OVERRIDE],
+            # Hash/version-bound staging transforms.  A fresh record per
+            # manifest keeps the reviewed digests inside the self-digest, so
+            # staging and promotion validate the same reviewed bytes.
+            "compatibility_transforms": reviewed_compatibility_transforms(),
         },
         "overlay": {"source": str(overlay_source.resolve()), "destination": overlay_destination, "size": overlay_size, "sha256": overlay_sha},
     }

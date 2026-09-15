@@ -107,7 +107,15 @@ def test_stopped_and_unknown_capacity_do_not_fabricate_history(metrics_page: Pag
     page.reload()
     page.wait_for_function("document.querySelector('#metrics-run-note').textContent.includes('Server stopped')")
     assert page.locator('[data-metric="cpu"]').is_visible()
-    assert page.locator("#metric-cpu-chart .chart-line").get_attribute("points") == ""
+    # A stopped cold load shows the bounded recent history it actually has,
+    # explicitly labelled, instead of fabricating offline zeros.  Capacity is
+    # still unknown for a stopped profile.
+    page.wait_for_function(
+        "document.querySelector('#metrics-history-note').textContent.includes('Recent history · last observed')"
+    )
+    points = page.locator("#metric-cpu-chart .chart-line").get_attribute("points")
+    assert points and "NaN" not in points
+    assert page.locator("#metric-cpu-current").inner_text() == "12.0% (historical)"
     assert page.locator("#rail-cpu-capacity").get_attribute("aria-valuenow") is None
     assert "/ 0" not in page.locator("#rail-cpu").inner_text()
 

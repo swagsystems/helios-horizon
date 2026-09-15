@@ -287,6 +287,10 @@ class UnixRpcServer:
             if isinstance(payload, dict) and "generation" in payload
             else self.watch_hub.generation
         )
+        # A status snapshot is projected under the canonical browser event name;
+        # other read-only results keep their own request kind.
+        if isinstance(result, StatusSnapshot):
+            kind = "status"
         await self.watch_hub.publish(
             kind, payload, generation=generation, full=isinstance(result, StatusSnapshot)
         )

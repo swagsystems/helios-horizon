@@ -353,3 +353,49 @@ def test_units_are_timer_driven_and_never_own_the_java_backend():
     assert "Description=Check the Horizon Minecraft Bore relay every 30 seconds" in timer
     assert "OnUnitActiveSec=30s" in timer
     assert "Persistent=" not in timer
+
+
+def test_fenced_relay_recovers_clean_and_failed_exits_with_bounded_retries():
+    unit = (ROOT / "ops/systemd/bore-minecraft-fenced.service").read_text()
+    unit_section = unit.split("[Unit]", 1)[1].split("[Service]", 1)[0]
+    # `Restart=always` covers the clean exit a dropped or rebooted remote relay
+    # produces; `systemctl stop` is still the untouched intentional-stop path
+    # because systemd never restarts a unit after an explicit stop request.
+    assert "Restart=always" in unit
+    assert "RestartSec=15" in unit
+    restart_sec = int(unit.split("RestartSec=", 1)[1].splitlines()[0])
+    assert 5 <= restart_sec <= 60
+    # An unbounded start rate limit (0) keeps a long remote outage from
+    # stranding the client in `failed`, which is what previously required a
+    # manual start. Retries stay paced by RestartSec, so this is not a hot loop.
+    assert "StartLimitIntervalSec=0" in unit_section
+    assert "StartLimitBurst" not in unit_section
+    # The existing fences that gate every start job must survive the change.
+    assert "ConditionPathExists=/etc/game-control/arm/bore-minecraft" in unit
+    assert "ExecStartPre=+/usr/bin/sh -c" in unit
+    assert "stat -c %%u:%%a" in unit and "0:600" in unit
+    assert "OnFailure=horizon-alert-notify@bore-minecraft-fenced.service" in unit
+    assert "[Install]" not in unit
+
+
+def test_inactive_or_failed_relay_is_never_started_indiscriminately(tmp_path, monkeypatch):
+    module = _module()
+    _configure_runtime(module, tmp_path, monkeypatch)
+    module._save_state({"failures": 4, "first_failure": 700, "last_restart": 0})
+    # is-active is false for both an operator stop and a failed unit, so the
+    # timer must leave recovery to the unit's restart policy and the operator.
+    monkeypatch.setattr(
+        module,
+        "_service_active",
+        lambda unit: False if unit == module.BORE_UNIT else True,
+    )
+    monkeypatch.setattr(
+        module,
+        "_restart_bore",
+        lambda: (_ for _ in ()).throw(AssertionError("must not start an inactive relay")),
+    )
+    assert module._run_once() == 0
+    assert module._load_state() == {"failures": 0, "first_failure": 0, "last_restart": 0}
+    helper = HELPER.read_text()
+    assert "\"restart\"" in helper
+    assert "\"start\"" not in helper

@@ -5,6 +5,7 @@ import json
 import os
 import errno
 import subprocess
+import sqlite3
 import tarfile
 import io
 import time
@@ -76,6 +77,28 @@ class _Db:
 
     def delete_backup(self, backup_id):
         self.rows[:] = [row for row in self.rows if row["id"] != backup_id]
+
+    def list_backups(self, profile_id):
+        return list(self.rows)
+
+
+class _Catalog:
+    """Real scratch catalog exposing the ``.connection`` the prune fence inspects."""
+
+    def __init__(self, path: Path) -> None:
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("CREATE TABLE backups (id TEXT PRIMARY KEY)")
+        self.rows: list[dict] = []
+
+    def insert_backup(self, **row):
+        self.rows.append(row)
+        self.connection.execute("INSERT OR REPLACE INTO backups (id) VALUES (?)", (row["id"],))
+        self.connection.commit()
+
+    def delete_backup(self, backup_id):
+        self.rows[:] = [row for row in self.rows if row["id"] != backup_id]
+        self.connection.execute("DELETE FROM backups WHERE id = ?", (backup_id,))
+        self.connection.commit()
 
     def list_backups(self, profile_id):
         return list(self.rows)
@@ -643,12 +666,30 @@ def test_snapshot_falls_back_to_copy_on_cross_device_link(tmp_path: Path, monkey
 
 def test_protected_retention_keeps_two_verified_and_never_sole_verified(tmp_path: Path):
     profile = _profile(tmp_path)
-    db = _Db()
-    service = BackupService(profile, database=db, stopped_check=lambda: True)
-    results = [service.create(protected=index == 0) for index in range(3)]
+    # The filesystem-only legacy path has no persisted protection flags, but
+    # retention still keeps at least two verified payloads.
+    uncatalogued = BackupService(profile, database=None, stopped_check=lambda: True)
+    plain = [uncatalogued.create() for _ in range(3)]
+    uncatalogued.prune(keep=2)
+    assert sum(result.path.exists() for result in plain) == 2
+    uncatalogued.prune(keep=0)
+    assert sum(result.path.exists() for result in plain) == 2
 
-    service.prune(keep=2)
-    assert results[0].path.exists()
-    assert sum(result.path.exists() for result in results) >= 2
-    service.prune(keep=0)
-    assert results[0].path.exists()
+    # Catalogued path: a durable catalog the fence can inspect must refuse
+    # legacy deletion of a catalog-backed payload instead of deleting it.
+    catalog = _Catalog(tmp_path / "catalog.db")
+    catalogued = BackupService(profile, database=catalog, stopped_check=lambda: True)
+    results = [catalogued.create(protected=index == 0) for index in range(3)]
+    assert next(item for item in catalogued.list() if item.id == results[0].id).protected
+    with pytest.raises(SafeError, match="retirement operation"):
+        catalogued.prune(keep=1)
+    assert all(result.path.exists() for result in results)
+    catalog.connection.close()
+
+    # A catalog reporting retained rows but lacking an inspectable connection
+    # also fails closed. An empty fake would exercise the no-op branch only.
+    opaque = BackupService(profile, database=_Db(), stopped_check=lambda: True)
+    opaque_results = [opaque.create(protected=index == 0) for index in range(3)]
+    with pytest.raises(SafeError, match="could not be inspected"):
+        opaque.prune(keep=1)
+    assert all(result.path.exists() for result in opaque_results)

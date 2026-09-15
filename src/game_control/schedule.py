@@ -120,6 +120,8 @@ def parse_schedule(raw: Any) -> tuple[ScheduleEntry, ...]:
         operation = item.get("operation", "backup" if destination is not None else "switch")
         if operation not in {"backup", "switch", "benchmark"}:
             raise ValueError("invalid schedule operation")
+        if operation == "backup" and destination is None:
+            raise ValueError("backup schedule requires a destination")
         baseline = item.get("baseline_preset")
         candidate = item.get("candidate_preset")
         campaign = item.get("campaign")

@@ -1,0 +1,208 @@
+rule_files:
+  - horizon-laptop-backup-rules.yml
+evaluation_interval: 1m
+# Series carry the job/instance labels a real node_exporter scrape attaches, so
+# the fixtures exercise the production label shape rather than a bare series.
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '0x12'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x12'
+      - series: 'helios_laptop_backup_last_success_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x12'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HeliosHorizonLaptopBackupCollectorFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: node
+              instance: helios
+            exp_annotations:
+              summary: "laptop backup collector reported failure"
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x12'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HeliosHorizonLaptopBackupCollectorStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "laptop backup collector metrics are missing or stale"
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x20'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: HeliosHorizonLaptopBackupNoSuccessKnown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node
+              instance: helios
+            exp_annotations:
+              summary: "laptop backup collector reports no successful backup yet"
+  # Two hosts: one has a fresh success, one has none. Only the host without a
+  # success fires, with its own labels.
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="a"}'
+        values: '1x20'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="a"}'
+        values: '0+60x20'
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="b"}'
+        values: '1x20'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="b"}'
+        values: '0+60x20'
+      - series: 'helios_laptop_backup_last_success_timestamp_seconds{job="node",instance="b"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: HeliosHorizonLaptopBackupNoSuccessKnown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node
+              instance: a
+            exp_annotations:
+              summary: "laptop backup collector reports no successful backup yet"
+  # A legitimate first run inside the 6h limit is not a failure and not
+  # "no success known".
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x40'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x40'
+      - series: 'helios_laptop_backup_last_attempt_running{job="node",instance="helios"}'
+        values: '1x40'
+      - series: 'helios_laptop_backup_last_attempt_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x40'
+      - series: 'helios_laptop_backup_last_attempt_hard_failure{job="node",instance="helios"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HeliosHorizonLaptopBackupNoSuccessKnown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: HeliosHorizonLaptopBackupStuckRunning
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: HeliosHorizonLaptopBackupFailed
+        exp_alerts: []
+  # A run past the sender's 6h service limit is surfaced as a warning.
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x40'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x40'
+      - series: 'helios_laptop_backup_last_attempt_running{job="node",instance="helios"}'
+        values: '1x40'
+      - series: 'helios_laptop_backup_last_attempt_timestamp_seconds{job="node",instance="helios"}'
+        values: '-40000x40'
+      - series: 'helios_laptop_backup_last_attempt_hard_failure{job="node",instance="helios"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HeliosHorizonLaptopBackupStuckRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: node
+              instance: helios
+            exp_annotations:
+              summary: "laptop backup attempt has been running longer than the 6h service limit"
+      - eval_time: 20m
+        alertname: HeliosHorizonLaptopBackupFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x40'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x40'
+      - series: 'helios_laptop_backup_last_success_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x40'
+      - series: 'helios_laptop_backup_last_attempt_hard_failure{job="node",instance="helios"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HeliosHorizonLaptopBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node
+              instance: helios
+            exp_annotations:
+              summary: "laptop backup attempt failed, excluding AC or battery deferral"
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x60'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x60'
+      - series: 'helios_laptop_backup_last_success_timestamp_seconds{job="node",instance="helios"}'
+        values: '-130800x60'
+      - series: 'helios_laptop_backup_last_attempt_hard_failure{job="node",instance="helios"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: HeliosHorizonLaptopBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: node
+              instance: helios
+            exp_annotations:
+              summary: "no successful laptop backup within 36h"
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x60'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x60'
+      - series: 'helios_laptop_backup_last_success_timestamp_seconds{job="node",instance="helios"}'
+        values: '-105600x60'
+      - series: 'helios_laptop_backup_last_attempt_hard_failure{job="node",instance="helios"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: HeliosHorizonLaptopBackupStale
+        exp_alerts: []
+  # A transient collector error after a recent success: collector alert only, no
+  # false backup-age or never-success claim once the series goes stale.
+  - interval: 1m
+    input_series:
+      - series: 'helios_laptop_backup_collector_success{job="node",instance="helios"}'
+        values: '1x5 0x15'
+      - series: 'helios_laptop_backup_collector_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x5 _x15'
+      - series: 'helios_laptop_backup_last_success_timestamp_seconds{job="node",instance="helios"}'
+        values: '0+60x5 _x15'
+      - series: 'helios_laptop_backup_last_attempt_hard_failure{job="node",instance="helios"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: HeliosHorizonLaptopBackupCollectorFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: node
+              instance: helios
+            exp_annotations:
+              summary: "laptop backup collector reported failure"
+      - eval_time: 16m
+        alertname: HeliosHorizonLaptopBackupStale
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: HeliosHorizonLaptopBackupNoSuccessKnown
+        exp_alerts: []
