@@ -272,6 +272,8 @@ def test_player_totals_empty_states_and_heatmap_name_the_selected_window(history
 def test_last_observed_tick_values_are_marked_outside_the_selected_window(history_page: Page):
     page = history_page
     page.locator("#stats-window").select_option("1h")
+    # The previous window's notice may already be visible while this request loads.
+    expect(page.locator("#stats-last-observed")).to_contain_text("last 1 hour")
     expect(page.locator("#stats-last-observed")).to_be_visible()
     note = page.locator("#stats-last-observed").inner_text()
     assert "outside the selected window" in note
