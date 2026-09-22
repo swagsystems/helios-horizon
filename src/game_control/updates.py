@@ -9,6 +9,7 @@ import inspect
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -473,7 +474,16 @@ class UpdateService:
                         raise SafeError("update_failed", "release archive is invalid")
                     if (member.external_attr >> 16) & 0o170000 == 0o120000:
                         raise SafeError("update_failed", "release archive is invalid")
-                    archive.extract(member, staging)
+                    extracted = archive.extract(member, staging)
+                    if not member.is_dir():
+                        # zipfile does not restore Unix execution permission.
+                        # Treat DOS/untyped attributes as data and never copy
+                        # privilege or group/world-write bits from a ZIP.
+                        mode = 0o644
+                        unix_mode = member.external_attr >> 16
+                        if member.create_system == 3 and stat.S_ISREG(unix_mode):
+                            mode |= unix_mode & 0o111
+                        os.chmod(extracted, mode)
             return
         try:
             with tarfile.open(archive_path, "r:*") as archive:
