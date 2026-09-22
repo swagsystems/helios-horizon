@@ -769,9 +769,7 @@ class Controller:
         changed = await self._transaction(mark_incomplete)
         reconcile = getattr(self.reservation_store, "reconcile", None)
         if reconcile is not None:
-            result = reconcile()
-            if inspect.isawaitable(result):
-                result = await result
+            result = await self._reservation_io(reconcile)
             changed = changed or bool(result)
         if self.slot_inspector is not None:
             self.slot_inspector.observe()
@@ -1034,10 +1032,58 @@ class Controller:
         async def renew():
             while True:
                 await asyncio.sleep(5.0)
-                result = self.reservation_store.renew_if_owned(*lease[:2], ttl=30.0, state_generation=lease[2])
-                if inspect.isawaitable(result):
-                    await result
+                await self._reservation_io(
+                    self.reservation_store.renew_if_owned,
+                    *lease[:2], ttl=30.0, state_generation=lease[2],
+                )
         return asyncio.create_task(renew())
+
+    async def _reservation_io(
+        self,
+        callback: Callable[..., Any],
+        *args: Any,
+        cancel_cleanup: Callable[[], Awaitable[Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run file-store flock work off-loop and drain it before cancellation.
+
+        Transaction callbacks and SQLite must stay on the owning event loop.
+        Only reservation-store work belongs here. A successful acquisition or
+        transfer can require exact-owner cleanup if its caller was cancelled
+        before receiving the new lease.
+        """
+        async def invoke() -> Any:
+            if inspect.iscoroutinefunction(callback):
+                return await callback(*args, **kwargs)
+            result = await asyncio.to_thread(callback, *args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+        task = asyncio.create_task(invoke())
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
+            except BaseException:
+                if cancelled:
+                    raise asyncio.CancelledError
+                raise
+        if cancelled:
+            if cancel_cleanup is not None:
+                try:
+                    # The same drain rule also protects cleanup against a
+                    # second cancellation arriving while it waits for flock.
+                    await self._reservation_io(cancel_cleanup)
+                except asyncio.CancelledError:
+                    pass
+                except BaseException:
+                    _LOG.warning("cancelled reservation cleanup failed")
+            raise asyncio.CancelledError
+        return result
 
     async def _assert_lease(self, task) -> None:
         if task.done():
@@ -1054,30 +1100,33 @@ class Controller:
         if renewal is None:
             return None
         renewal.cancel()
-        try:
-            await renewal
-            return None
-        except asyncio.CancelledError:
-            return None
-        except BaseException:
-            return sys.exc_info()[1]
+
+        async def drain() -> BaseException | None:
+            try:
+                await renewal
+                return None
+            except asyncio.CancelledError:
+                return None
+            except BaseException:
+                return sys.exc_info()[1]
+
+        # Renewal's intentional cancellation is handled inside drain, while
+        # cancellation of the releasing caller remains distinguishable.
+        return await self._reservation_io(drain)
 
     async def _release_lease(self, lease, renewal: asyncio.Task | None) -> None:
         """Always release a reservation after renewal task termination."""
         primary_active = sys.exc_info()[0] is not None
-        renewal_error = await self._drain_renewal(renewal)
+        try:
+            renewal_error = await self._drain_renewal(renewal)
+        except asyncio.CancelledError:
+            renewal_error = sys.exc_info()[1]
         cleanup_error = None
         if lease is not None:
-            cleanup = asyncio.create_task(self._clear_reservation(lease))
             try:
-                await asyncio.shield(cleanup)
+                await self._reservation_io(self._clear_reservation, lease)
             except BaseException:
-                # A caller may itself be cancelling. Drain the shielded
-                # cleanup task before deciding whether its error is primary.
-                try:
-                    await cleanup
-                except BaseException:
-                    cleanup_error = sys.exc_info()[1]
+                cleanup_error = sys.exc_info()[1]
         if primary_active:
             if renewal_error is not None or cleanup_error is not None:
                 _LOG.warning("lease cleanup failed while preserving primary error")
@@ -1359,7 +1408,7 @@ class Controller:
             await self._fresh_stop_preflight(profile, actor, request_id, allow_players=allow_players)
             await self._assert_lease(renewal_task)
             return lease, renewal_task
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             await self._release_lease(lease, renewal_task)
             raise
 
@@ -1491,19 +1540,23 @@ class Controller:
         lease_id = operation_id or uuid4().hex
         if self.reservation_store is None:
             return profile.id, lease_id, generation
-        try:
+        lease = (profile.id, lease_id, generation)
+        existing = None
+
+        def reserve() -> Any:
+            nonlocal existing
             reserve_atomic = getattr(self.reservation_store, "reserve_if_available", None)
             if reserve_atomic is not None:
                 reservation_id = lease_id
                 try:
-                    reserve_atomic(
+                    return reserve_atomic(
                         profile.id, reservation_id, 30.0,
                         state_generation=generation,
                     )
                 except TypeError:
                     # Narrow test seams may predate the generation keyword;
                     # they still provide an atomic reserve operation.
-                    reserve_atomic(profile.id, reservation_id, 30.0)
+                    return reserve_atomic(profile.id, reservation_id, 30.0)
             else:
                 # Test doubles from Task 2 may only expose reserve; keep the
                 # lock transaction around their check/commit if possible.
@@ -1511,7 +1564,12 @@ class Controller:
                     existing = self.reservation_store.read()
                     if existing is not None and existing.profile_id != profile.id:
                         raise BlockingIOError
-                    self.reservation_store.reserve(profile.id, lease_id, 30.0)
+                    return self.reservation_store.reserve(profile.id, lease_id, 30.0)
+
+        try:
+            await self._reservation_io(
+                reserve, cancel_cleanup=lambda: self._clear_reservation(lease),
+            )
         except Exception as exc:
             await self._record_event(profile.id, ErrorCode.SLOT_CONFLICT.value, "game slot is unavailable")
             await self._record_rejected_audit(
@@ -1521,13 +1579,13 @@ class Controller:
                 ErrorCode.SLOT_CONFLICT,
                 "game slot is reserved",
             )
-            owner = getattr(locals().get("existing", None), "profile_id", None)
+            owner = getattr(existing, "profile_id", None)
             raise _ControllerFailure(
                 ErrorCode.SLOT_CONFLICT,
                 "game slot is reserved",
                 details=SafeDetails(current_owner=owner),
             ) from exc
-        return profile.id, lease_id, generation
+        return lease
 
     async def _clear_reservation(self, lease: tuple[ProfileId, str, int] | None = None) -> None:
         store = self.reservation_store
@@ -1536,15 +1594,11 @@ class Controller:
         if lease is not None:
             release = getattr(store, "release_if_owned", None)
             if release is not None:
-                result = release(*lease)
-                if inspect.isawaitable(result):
-                    await result
+                await self._reservation_io(release, *lease)
                 return
         clear = getattr(store, "clear", None)
         if clear:
-            result = clear()
-            if inspect.isawaitable(result):
-                await result
+            await self._reservation_io(clear)
             return
         path = getattr(store, "reservation_path", None)
         if path is not None:
@@ -1713,12 +1767,13 @@ class Controller:
                                 raise
                     if lease is not None and hasattr(self.reservation_store, "transfer_if_owned"):
                         rollback_id = uuid4().hex
-                        rollback = self.reservation_store.transfer_if_owned(
+                        transferred_lease = (source_profile.id, rollback_id, lease[2])
+                        await self._reservation_io(
+                            self.reservation_store.transfer_if_owned,
                             lease[0], lease[1], lease[2], source_profile.id, rollback_id,
+                            cancel_cleanup=lambda: self._clear_reservation(transferred_lease),
                         )
-                        if inspect.isawaitable(rollback):
-                            rollback = await rollback
-                        rollback_lease = (source_profile.id, rollback_id, lease[2])
+                        rollback_lease = transferred_lease
                         lease = None
                     else:
                         if lease is not None:
@@ -2024,6 +2079,7 @@ class Controller:
             due = tuple(entry for entry in due if entry.operation != "benchmark")
             if not due:
                 return
+        switch_due = []
         for entry in due:
             # Claim each fire immediately before executing it. This is
             # intentionally sequential: duplicate config entries in one due
@@ -2031,6 +2087,8 @@ class Controller:
             if self._schedule_fire_seen(entry, snapshot.observed_at):
                 continue
             await self._record_event(entry.profile, "scheduled_fire", self._schedule_fire_key(entry, snapshot.observed_at))
+            if entry.operation == "switch":
+                switch_due.append(entry)
             if entry.operation != "backup" or entry.backup_destination is None:
                 continue
             action = CreateBackup(
@@ -2068,7 +2126,7 @@ class Controller:
                     "deferred" if deferred else "failed",
                     entry.profile.value,
                 )
-        due = tuple(entry for entry in due if entry.operation == "switch")
+        due = tuple(switch_due)
         if not due:
             return
         statuses = {item.profile_id: item for item in snapshot.profiles}
@@ -2382,7 +2440,7 @@ class Controller:
         renewal = self._lease_renewal(lease)
         try:
             await self._assert_lease(renewal)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             await self._release_lease(lease, renewal)
             raise
         return lease, renewal
@@ -2658,7 +2716,7 @@ class Controller:
                 and current.controller_start_ticks == handoff.controller_start_ticks
             )
 
-        if not lease_check():
+        if not await self._reservation_io(lease_check):
             raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "update handoff is unavailable")
         return await self._run_bound_maintenance_job(
             profile, operation, action, actor, request_id, service,
@@ -2753,7 +2811,8 @@ class Controller:
             if not callable(authorize):
                 raise _ControllerFailure(ErrorCode.SLOT_CONFLICT, "update handoff is unavailable")
             try:
-                handoff = authorize(
+                handoff = await self._reservation_io(
+                    authorize,
                     profile.id,
                     action.reservation_capability,
                     operation_kind="update",
