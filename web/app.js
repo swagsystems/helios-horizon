@@ -83,6 +83,9 @@ const state = {
   perf: { firstStatusPaint: false, pendingMutations: new Map(), clientQueue: [], clientTimer: null },
 };
 let aggregateBackupRequest = 0;
+let scheduleMutationPending = false;
+let scheduleRevision = 0;
+let scheduleLoadRequest = 0;
 let reauthenticating = false;
 let sessionRefreshPromise = null;
 let sessionExpired = false;
@@ -3850,7 +3853,17 @@ function renderSchedulePreview() {
   const submit = byId("schedule-submit");
   const draft = scheduleDraftState();
   if (preview) preview.textContent = draft.message;
-  if (submit) submit.disabled = !draft.next;
+  if (submit) submit.disabled = scheduleMutationPending || !draft.next;
+}
+
+function syncScheduleControls() {
+  document.querySelector(".schedule-settings")?.setAttribute("aria-busy", String(scheduleMutationPending));
+  ["schedule-cron", "schedule-profile"].forEach((id) => { if (byId(id)) byId(id).disabled = scheduleMutationPending; });
+  document.querySelectorAll("[data-schedule-toggle], [data-schedule-remove]").forEach((control) => {
+    const operation = control.closest("[data-schedule-row]")?.dataset.scheduleOperation;
+    control.disabled = scheduleMutationPending || !SCHEDULE_OPERATIONS.includes(operation);
+  });
+  renderSchedulePreview();
 }
 
 function scheduleOperation(item) {
@@ -3936,6 +3949,7 @@ function renderScheduleRows(items) {
     }
     actions.append(toggle, remove); row.append(copy, actions); list.append(row);
   });
+  syncScheduleControls();
 }
 
 async function renderSchedules() {
@@ -3943,16 +3957,18 @@ async function renderSchedules() {
   renderScheduleProfiles();
   const timezone = byId("schedule-timezone");
   if (timezone) timezone.textContent = `Cron expressions are evaluated in UTC by the controller. Next runs are shown in ${scheduleTimezoneName()} and in UTC.`;
-  renderSchedulePreview();
+  syncScheduleControls();
   if (state.focusSchedules) {
     state.focusSchedules = false;
     const heading = byId("schedules-title");
     heading?.scrollIntoView({ block: "start" });
     heading?.focus({ preventScroll: true });
   }
+  if (scheduleMutationPending) return;
   try {
-    state.detail.schedules = await loadSchedules();
-    renderScheduleRows(state.detail.schedules);
+    const schedules = await loadSchedules();
+    if (schedules === null) return;
+    renderScheduleRows(schedules);
     byId("schedule-status").textContent = "Schedule changes apply without restarting Horizon.";
   } catch (error) {
     byId("schedule-list").replaceChildren();
@@ -3962,8 +3978,18 @@ async function renderSchedules() {
 }
 
 async function loadSchedules() {
-  const response = await api("/api/v1/schedules");
+  if (scheduleMutationPending) return null;
+  const request = ++scheduleLoadRequest;
+  const revision = scheduleRevision;
+  const current = () => request === scheduleLoadRequest && revision === scheduleRevision && !scheduleMutationPending;
+  let response;
+  try { response = await api("/api/v1/schedules"); }
+  catch (error) { if (!current()) return null; throw error; }
+  // A save fences both successful and failed reads started before it. A late
+  // refresh must not replace the confirmed book or its success message.
+  if (!current()) return null;
   state.schedules = Array.isArray(response.schedules) ? response.schedules : [];
+  state.detail.schedules = state.schedules;
   renderAutomationSummary(state.schedules);
   return state.schedules;
 }
@@ -3981,18 +4007,30 @@ function schedulePayload(item) {
 }
 
 async function replaceSchedules(entries, confirmation) {
-  if (!window.confirm(confirmation)) return false;
-  const response = await api("/api/v1/schedules", { method: "POST", body: JSON.stringify({ entries }) });
-  state.detail.schedules = Array.isArray(response.schedules) ? response.schedules : [];
-  state.schedules = state.detail.schedules;
-  renderAutomationSummary(state.schedules);
-  renderScheduleRows(state.detail.schedules);
-  byId("schedule-status").textContent = "Schedule changes applied live.";
-  return true;
+  if (scheduleMutationPending || !window.confirm(confirmation)) return false;
+  // Every edit replaces the full book. Keep add/remove/toggle mutually
+  // exclusive until the response supplies the next edit's authoritative base.
+  scheduleMutationPending = true;
+  scheduleRevision += 1;
+  syncScheduleControls();
+  byId("schedule-status").textContent = "Saving schedule changes…";
+  try {
+    const response = await api("/api/v1/schedules", { method: "POST", body: JSON.stringify({ entries }) });
+    state.detail.schedules = Array.isArray(response.schedules) ? response.schedules : [];
+    state.schedules = state.detail.schedules;
+    renderAutomationSummary(state.schedules);
+    renderScheduleRows(state.detail.schedules);
+    byId("schedule-status").textContent = "Schedule changes applied live.";
+    return true;
+  } finally {
+    scheduleMutationPending = false;
+    syncScheduleControls();
+  }
 }
 
 async function addSchedule(event) {
   event.preventDefault();
+  if (scheduleMutationPending) return;
   const cron = byId("schedule-cron").value.trim();
   const profile = byId("schedule-profile").value;
   if (!cron || !profile) return;
@@ -4011,6 +4049,7 @@ async function addSchedule(event) {
 }
 
 async function removeSchedule(index, item) {
+  if (scheduleMutationPending) return;
   const entries = (state.detail.schedules || []).filter((_, candidate) => candidate !== index).map(schedulePayload);
   const nextFocusIndex = Math.min(index, entries.length - 1);
   try {
@@ -4023,6 +4062,7 @@ async function removeSchedule(index, item) {
 }
 
 async function toggleSchedule(index, item, control) {
+  if (scheduleMutationPending) return;
   const nextEnabled = item.enabled === false;
   const entries = (state.detail.schedules || []).map(schedulePayload);
   entries[index].enabled = nextEnabled;
@@ -4082,13 +4122,16 @@ async function saveIdleStop(event) {
 
 async function loadDetailLogs(id) {
   if (!pageVisible() || !id) return;
+  const visible = () => state.detail.id === id && detailViewActive() && ["console", "logs"].includes(state.detail.tab);
   const item = state.logs.get(id) || { query: "", severity: "all", paused: false, lines: [], autoScroll: true, clearedAt: null, hideNoise: true, nextCursor: null };
   if (item.loading) return;
   item.loading = true;
   state.logs.set(id, item);
-  byId("detail-log-query").value = item.query;
-  byId("detail-log-severity").value = item.severity;
-  byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs";
+  if (visible()) {
+    byId("detail-log-query").value = item.query;
+    byId("detail-log-severity").value = item.severity;
+    byId("detail-log-pause").textContent = item.paused ? "Resume live logs" : "Pause live logs";
+  }
   try {
     const params = new URLSearchParams({ limit: "200", severity: "all" });
     if (item.nextCursor) params.set("cursor", item.nextCursor);
@@ -4102,8 +4145,11 @@ async function loadDetailLogs(id) {
       item.lines = item.lines.slice(-DETAIL_LOG_BUFFER_LIMIT);
       item.nextCursor = page.next_cursor || null;
     }
-  } catch (error) { notify(error.message || "Logs unavailable."); }
+  } catch (error) { if (visible()) notify(error.message || "Logs unavailable."); }
   item.loading = false;
+  // Keep the per-profile cache and release its loading flag even after
+  // navigation, but never repaint another profile's shared detail controls.
+  if (!visible()) return;
   renderDetailLogs(item);
   patchDetail(id);
 }
