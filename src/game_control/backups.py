@@ -1309,30 +1309,35 @@ class RestoreService:
                             self._assert_lease()
                             if target.path.exists():
                                 os.replace(target.path, rollback)
-                                _fsync_dir(target.path.parent)
                             else:
                                 rollback_by_root[root_id] = None
                             rollbacks.append(rollback_by_root[root_id])
+                            # A successful rename must be reversible even if
+                            # the following durability operation fails.
                             displaced.append(root_id)
+                            if rollback_by_root[root_id] is not None:
+                                _fsync_dir(target.path.parent)
                             _write_json_fsync(journal, {"phase": "displacing", "backup_id": manifest["backup_id"], "displaced": list(displaced), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root.get(rid)) if rollback_by_root.get(rid) else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                         _write_json_fsync(journal, {"phase": "displaced", "backup_id": manifest["backup_id"], "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                         for root_id, target in targets.items():
                             _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                             self._assert_lease()
                             os.replace(stagings[root_id], target.path)
-                            _fsync_dir(target.path.parent)
                             activated.append(root_id)
+                            _fsync_dir(target.path.parent)
                             _write_json_fsync(journal, {"phase": "publishing", "backup_id": manifest["backup_id"], "activated": list(activated), "roots": [{"root_id": rid, "destination": str(targets[rid].path), "staging": str(stagings[rid]), "rollback": str(rollback_by_root[rid]) if rollback_by_root[rid] else None, "original_exists": targets[rid].inode != 0} for rid in targets]})
                     except Exception:
                         for root_id in activated:
                             target = targets[root_id]
                             if target.path.exists():
-                                shutil.rmtree(target.path, ignore_errors=True)
+                                shutil.rmtree(target.path)
+                                _fsync_dir(target.path.parent)
                         for root_id in displaced:
                             target = targets[root_id]
                             rollback = rollback_by_root[root_id]
                             if rollback is not None and rollback.exists():
                                 os.replace(rollback, target.path)
+                                _fsync_dir(target.path.parent)
                         raise
                     destination = targets[next(iter(targets))].path
                     result = RestoreResult(
