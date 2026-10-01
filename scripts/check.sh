@@ -16,7 +16,8 @@ if (( $# == 1 )); then
   pytest_args+=(--cov=game_control --cov-report=term)
 fi
 
-uv run pytest "${pytest_args[@]}"
-uv run python tools/quality/check_public_boundary.py --root "$root_dir"
+uv lock --check
+uv run --frozen pytest "${pytest_args[@]}"
+uv run --frozen python tools/quality/check_public_boundary.py --root "$root_dir"
 node --check web/app.js web/palette.js web/commands.js
 git diff --check
