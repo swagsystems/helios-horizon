@@ -23,12 +23,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - run: uv sync --frozen --extra test
-      - run: uv run python -m compileall -q src ops scripts tests tools
+      - run: uv sync --locked --extra test
+      - run: uv run --frozen python -m compileall -q src ops scripts tests tools
       - name: Check public repository boundary
-        run: uv run python tools/quality/check_public_boundary.py --root .
+        run: uv run --frozen python tools/quality/check_public_boundary.py --root .
       - name: Run privilege-boundary unit tests
-        run: sudo --preserve-env=UV_PYTHON,UV_CACHE_DIR env "PATH=$PATH" PYTHONDONTWRITEBYTECODE=1 uv run pytest -q --ignore=tests/browser
+        run: sudo --preserve-env=UV_PYTHON,UV_CACHE_DIR env "PATH=$PATH" PYTHONDONTWRITEBYTECODE=1 uv run --frozen pytest -q --ignore=tests/browser
 
   browser:
     name: Browser tests
@@ -39,9 +39,9 @@ jobs:
         with:
           python-version: "3.11"
           enable-cache: true
-      - run: uv sync --frozen --extra test
-      - run: uv run playwright install chromium
-      - run: uv run pytest -q tests/browser
+      - run: uv sync --locked --extra test
+      - run: uv run --frozen playwright install chromium
+      - run: uv run --frozen pytest -q tests/browser
 
   security:
     name: Secret scan
